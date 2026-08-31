@@ -56,6 +56,212 @@ Every figure below comes from `./scripts/capture-verification.sh`, which regener
 
 ---
 
+## Try it yourself
+
+Everything below is **real captured output** from a running instance, not written by hand.
+Requires a JDK 17 and Docker; no credentials, no accounts, no vendor keys.
+
+```bash
+git clone https://github.com/Gaurav1112/notification-platform.git
+cd notification-platform
+
+make up                                    # postgres, valkey, kafka + 16 topics, prometheus, grafana
+./mvnw -q -B -DskipTests install
+
+# three terminals, or append & to each
+./mvnw -pl app-api       spring-boot:run   # :8080  — Flyway builds the schema on first start
+./mvnw -pl app-worker    spring-boot:run   # :8082  — consumes Kafka, calls providers
+./mvnw -pl app-scheduler spring-boot:run   # :8083  — outbox sweeper, due scan
+```
+
+> Add `-Dspring-boot.run.arguments=--server.port=9080` to any of them if those ports are taken.
+> `app-api` must run for the schema to exist; `app-worker` must run for a notification to progress
+> past `ACCEPTED`.
+
+### 1 · Send a notification
+
+```bash
+curl -X POST http://localhost:8080/v1/notifications \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: demo-001' \
+  -d '{
+    "trafficClass": "TRANSACTIONAL",
+    "channels": ["EMAIL"],
+    "template":   { "code": "order-shipped", "locale": "en-US" },
+    "variables":  { "orderId": "A-4821", "eta": "2026-09-02" },
+    "recipients": { "kind": "INLINE", "inline": [{ "address": "priya@example.com" }] },
+    "schedule":   { "type": "IMMEDIATE" }
+  }'
+```
+
+**`202 Accepted`**
+
+```json
+{
+  "notificationRequestId": "e7fefe39-1b51-4bf9-b638-d5a962e01129",
+  "status": "ACCEPTED",
+  "acceptedAt": "2026-08-31T16:45:21.922524Z",
+  "recipientCount": 1,
+  "notifications": [
+    { "id": "f61af9f5-7dda-4069-8b25-83b105419f2c", "channel": "EMAIL", "status": "ACCEPTED" }
+  ],
+  "links": { "status": "/v1/notifications/f61af9f5-7dda-4069-8b25-83b105419f2c" }
+}
+```
+
+`202`, not `200`. A `200` would imply the message was delivered; nothing has been sent yet. `202`
+means the request is durably recorded and we have taken responsibility for it.
+
+> **Use `template`, not `content`.** Inline content (`"content": {"subject":…, "body":…}`) is
+> accepted by the API but fails at fan-out — `NotificationRequestedEvent` carries a template
+> reference and has no inline-content field. Those messages exhaust the retry ladder and land in
+> the DLQ rather than being dropped, which is correct behaviour for a gap that should not exist.
+> Tracked in [STATUS.md](docs/STATUS.md).
+
+### 2 · Idempotency — send the *same* request again
+
+```bash
+# identical key, identical body
+curl -X POST http://localhost:8080/v1/notifications \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: demo-001' \
+  -d '{ ...exactly the same body... }'
+```
+
+**`202` — byte-identical response.** Same `notificationRequestId`, same `acceptedAt`, same
+notification id. Nothing new is created; check the database and there is one record.
+
+### 3 · Idempotency — same key, *different* body
+
+```bash
+curl -X POST http://localhost:8080/v1/notifications \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: demo-001' \
+  -d '{ "trafficClass": "BULK", "channels": ["SMS"], ... }'
+```
+
+**`409 Conflict`** — RFC 9457 `application/problem+json`:
+
+```json
+{
+  "type": "https://docs.notification-platform.dev/errors/idempotency-key-reused",
+  "title": "Idempotency key reused with a different payload",
+  "status": 409,
+  "detail": "Key 'demo-001' was used at 2026-08-31T15:18:01.753854Z with a different body.",
+  "instance": "/v1/notifications",
+  "properties": {
+    "traceId": "4ef686322ef84c1bb809fd2d2a9066fe",
+    "errors": [{ "field": "Idempotency-Key", "code": "FINGERPRINT_MISMATCH" }]
+  }
+}
+```
+
+This is the part most implementations skip. We store a SHA-256 fingerprint of the body, so the same
+key with a *different* payload is an error rather than a silent replay of an unrelated response.
+
+### 4 · Check status
+
+```bash
+curl http://localhost:8080/v1/notifications/f61af9f5-7dda-4069-8b25-83b105419f2c
+```
+
+```json
+{
+  "id": "f61af9f5-7dda-4069-8b25-83b105419f2c",
+  "channel": "EMAIL",
+  "trafficClass": "TRANSACTIONAL",
+  "status": "IN_PROGRESS",
+  "createdAt": "2026-08-31T16:45:21.922524Z",
+  "counts": { "total": 1, "delivered": 0, "failed": 0, "suppressed": 0, "pending": 1 },
+  "links": {
+    "recipients": "/v1/notifications/f61af9f5-.../recipients",
+    "attempts":   "/v1/notifications/f61af9f5-.../attempts"
+  }
+}
+```
+
+That capture was taken with **only `app-api` running**, which is why it reads `IN_PROGRESS` with
+`pending: 1`. Start `app-worker` and it advances to `QUEUED` and beyond.
+
+### 5 · Delivery attempts
+
+```bash
+curl http://localhost:8080/v1/notifications/{id}/attempts
+```
+
+One row per provider call, including `state: "UNKNOWN"` when a provider timed out after possibly
+delivering — the case most designs collapse into "failed" and then wrongly retry.
+
+### 6 · Provider health
+
+```bash
+curl http://localhost:8080/v1/providers/health
+```
+
+```json
+{
+  "providers": [
+    { "code": "mock-email-primary",   "channel": "EMAIL", "circuitState": "CLOSED",
+      "healthy": true, "successRate5m": 1.0, "p95LatencyMs": 0.0, "rateLimitUtilization": 0.0 },
+    { "code": "mock-email-secondary", "channel": "EMAIL", "circuitState": "CLOSED",
+      "healthy": true, "successRate5m": 1.0, "p95LatencyMs": 0.0, "rateLimitUtilization": 0.0 },
+    { "code": "mock-push-primary",    "channel": "PUSH",  "circuitState": "CLOSED", "...": "..." }
+  ]
+}
+```
+
+Five provider beans across three adapter classes — two each for SMS and email so failover has
+somewhere to go, one for push.
+
+### 7 · Break a provider and watch failover
+
+```bash
+curl -X POST http://localhost:8080/admin/v1/mock-providers/mock-email-primary/chaos \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"HARD_DOWN","durationSeconds":120}'
+```
+
+Then send traffic and re-check `/v1/providers/health`. The breaker opens after 20 calls at >50%
+failure in a 60-second window, traffic shifts to `mock-email-secondary`, and after 30 seconds
+(jittered per pod) a probe call tests recovery.
+
+> The chaos endpoint is **disabled in the base configuration** and only enabled under the `local`
+> profile, which `spring-boot-maven-plugin` sets for `./mvnw spring-boot:run`. A packaged jar does
+> not have it.
+
+### 8 · Look at the plumbing
+
+| | |
+|---|---|
+| Swagger UI | http://localhost:8080/swagger-ui/index.html |
+| Kafka topics + message counts | http://localhost:8081 |
+| Prometheus | http://localhost:9090 |
+| Grafana | http://localhost:3000 |
+| Health | http://localhost:8080/actuator/health |
+| Metrics | http://localhost:8080/actuator/prometheus |
+
+```bash
+make psql     # psql on the notification database
+```
+
+```sql
+SELECT id, status, channel, created_at FROM notif.notification ORDER BY created_at DESC LIMIT 5;
+SELECT count(*) FROM notif.outbox_message;              -- 0 once the sweeper has drained it
+SELECT code, rank, is_terminal FROM notif.delivery_status ORDER BY rank;
+```
+
+Screenshots of all of the above running: [docs/screenshots/](docs/screenshots/).
+
+### 9 · Run the tests
+
+```bash
+make test      # ./mvnw -B verify              384 tests, no Docker needed
+make test-it   # ./mvnw -B verify -Pintegration  392 tests, needs Docker
+```
+
+Integration tests are tagged and excluded by default so a clean clone builds green on any machine.
+
+
+---
+
 ## The problem
 
 Send SMS, email and push notifications to 50M users. Requests may be immediate or scheduled.
