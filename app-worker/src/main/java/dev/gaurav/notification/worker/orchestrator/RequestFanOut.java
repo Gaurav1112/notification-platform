@@ -47,6 +47,17 @@ public class RequestFanOut {
 
     private static final Logger log = LoggerFactory.getLogger(RequestFanOut.class);
 
+    /**
+     * The window used to find the accept-time notification rows.
+     *
+     * <p>`notification` is partitioned by `created_at`, so a query without a time bound scans
+     * every partition. Accept and fan-out are normally milliseconds apart; the lookback is
+     * generous enough to cover a broker outage drained by the outbox sweeper, and the lookahead
+     * covers clock skew between the API pod and this one.
+     */
+    private static final java.time.Duration FANOUT_LOOKBACK = java.time.Duration.ofHours(25);
+    private static final java.time.Duration FANOUT_LOOKAHEAD = java.time.Duration.ofMinutes(5);
+
     private final NotificationRepository notifications;
     private final NotificationRecipientRepository recipients;
     private final RecipientManifestReader manifestReader;
@@ -110,14 +121,42 @@ public class RequestFanOut {
         int suppressed = 0;
         int deferred = 0;
 
+        // The accept transaction has already written one notification row per channel, and their
+        // ids are what we returned in the 202 and what the caller is polling. Creating fresh rows
+        // here — which this method used to do — orphaned every id we had handed out: the status
+        // endpoint kept reporting PENDING against a row nothing would ever advance, while a second,
+        // invisible row did the actual work. It also doubled the row count for every request.
+        //
+        // So adopt what accept created, keyed by channel. Anything not found is created, because
+        // a request can legitimately reach fan-out without an accept row: a replay after the
+        // notification partition was dropped, or a future scheduled path that enqueues directly.
+        var existing = notifications
+                .findByRequest(event.requestId(),
+                        now.minus(FANOUT_LOOKBACK), now.plus(FANOUT_LOOKAHEAD))
+                .stream()
+                .collect(java.util.stream.Collectors.toMap(
+                        NotificationEntity::getChannel,
+                        java.util.function.Function.identity(),
+                        (first, duplicate) -> first));
+
         for (Channel channel : event.channels()) {
             // Rendered once per channel, not once per recipient: the copy is identical for every
             // recipient of a campaign, and 10M identical renders is pure CPU with no output.
             var rendered = templates.render(
                     event.templateCode(), event.templateLocale(), channel, event.templateData());
 
-            var notification = newNotification(event, channel, now);
+            var notification = existing.get(channel);
+            if (notification == null) {
+                notification = newNotification(event, channel, now);
+                log.warn("no accept-time notification row for request {} channel {}; creating one. "
+                                + "Expected only on replay or a direct-enqueue path.",
+                        event.requestId(), channel);
+            }
             notification.setTotalRecipients(userRefs.size());
+            // QUEUED (30) outranks PENDING (10), so this advances the row the caller is polling
+            // instead of leaving it stuck behind a second row it cannot see.
+            notification.setStatus(DeliveryStatus.QUEUED);
+            notification.setStatusAt(now);
             notifications.save(notification);
 
             for (String userRef : userRefs) {
