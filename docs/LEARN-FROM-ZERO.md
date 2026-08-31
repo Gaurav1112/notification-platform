@@ -1,0 +1,1047 @@
+# Learn This System From Zero
+
+No prior Kafka, Redis or distributed-systems knowledge assumed. You know Java, Spring and SQL.
+
+We will follow **one single notification** — a shipping confirmation to a customer called Priya —
+through every step, looking at the actual database rows and the actual messages. Then we will
+break it eight different ways and watch exactly what happens.
+
+By the end you will be able to answer: what is this product, how does it work, and why is it built
+this way.
+
+---
+
+# PART 1 — What is this product?
+
+## 1.1 The business problem
+
+Imagine you work at a company like Flipkart. Dozens of teams need to send messages to customers:
+
+- The **orders team** needs to send "your order has shipped"
+- The **auth team** needs to send login OTPs
+- The **marketing team** needs to send "50% off sale, ends tonight" to 10 million people
+- The **payments team** needs to send "your refund has been processed"
+
+Every one of those teams could integrate with Twilio and SendGrid themselves. That is what usually
+happens first, and here is what goes wrong:
+
+| Problem | What it looks like |
+|---|---|
+| Twilio credentials in 12 codebases | One leaked key, and someone can send SMS on your account. Rotating it means 12 deploys. |
+| Each team writes its own retry logic | Eleven of them get it wrong. One of them sends OTPs three times. |
+| Nobody knows the total spend | Finance asks "why is our SMS bill $2M?" and no single team can answer. |
+| A user unsubscribes from marketing | The marketing team knows. The orders team doesn't, and keeps emailing them. |
+| Twilio goes down | Twelve teams have an incident. Twelve teams debug it separately. |
+| A user gets 40 notifications in a day | Nobody was tracking the total. They uninstall the app. |
+
+**So you build one platform.** Every team calls one API. The platform owns providers, retries,
+preferences, delivery tracking and spend. That is the product.
+
+## 1.2 What the product actually does
+
+```
+A team sends us:   "notify user u_9f2a that order A-4821 has shipped, by email and push"
+
+We are responsible for:
+   ✓ Saying yes immediately, and never losing it
+   ✓ Checking: has this user opted out? Is it 3am where they live? Have they had 5 already today?
+   ✓ Turning "order-shipped" into actual text in their language
+   ✓ Choosing which email provider to use right now
+   ✓ Handling it when that provider fails
+   ✓ Telling the orders team whether it actually arrived
+```
+
+## 1.3 The numbers that make it hard
+
+| | |
+|---|---|
+| Users | 50,000,000 |
+| Notifications per day | 5,000,000 (today) → 100,000,000 (target) |
+| Normal rate | ~1,200 per second |
+| **When marketing sends a campaign** | **14,583 per second** |
+
+That last row is the whole problem. **The system must handle a rate 12× its own average, on demand,
+without breaking the OTP that someone is waiting for right now.**
+
+---
+
+# PART 2 — The vocabulary, with real examples
+
+You need four concepts. Each one gets a concrete example, not a definition.
+
+## 2.1 Kafka
+
+### What it actually is
+
+Forget "message queue". Kafka is a **file you append to, and readers remember their own position in
+it.**
+
+Imagine a text file:
+
+```
+line 0:  {"notificationId": "abc", "to": "priya@example.com"}
+line 1:  {"notificationId": "def", "to": "raj@example.com"}
+line 2:  {"notificationId": "ghi", "to": "amit@example.com"}
+```
+
+- Writers only ever **append** to the end. They never modify or delete.
+- Readers keep a bookmark: *"I have read up to line 2."* That bookmark is called an **offset**.
+- **Reading does not remove anything.** The line stays in the file.
+
+That last point is the big one, and it is the main difference from a normal queue.
+
+### Why "reading doesn't delete" matters
+
+Suppose you deploy a bug at 09:00 that marks every notification as failed. You fix it at 11:00.
+
+**With RabbitMQ** (a normal queue): those messages were consumed and deleted. They are gone. You
+have no way to reprocess them.
+
+**With Kafka**: the messages are still in the file. You set your bookmark back to 09:00 and read
+them again.
+
+```
+Before: reader bookmark = line 4,000,000
+After:  reader bookmark = line 3,000,000   ← just move it back
+```
+
+That is called **replay**, and it is reason number one we chose Kafka.
+
+### Partitions
+
+One file would be a bottleneck — only one reader can read it in order. So Kafka splits a topic into
+several files, called **partitions**:
+
+```
+topic: notification.dispatch.email.tx     (12 partitions)
+
+partition 0:  msg  msg  msg  msg          ← consumer A reads this
+partition 1:  msg  msg  msg               ← consumer B reads this
+partition 2:  msg  msg  msg  msg  msg     ← consumer C reads this
+...
+partition 11: msg  msg                    ← consumer L reads this
+```
+
+12 partitions means up to 12 consumers working in parallel. **Partitions are the unit of
+parallelism.**
+
+### Which partition does a message go to?
+
+You give each message a **key**. Kafka does:
+
+```
+partition = hash(key) % numberOfPartitions
+```
+
+Our key is `tenantId|recipientId|channel`, for example `acme|u_9f2a|EMAIL`.
+
+```
+hash("acme|u_9f2a|EMAIL") % 12  =  7      → always partition 7
+```
+
+**Same key always goes to the same partition.** And since a partition is read in order, **all
+messages for Priya's email arrive in the order we sent them.** That is our ordering guarantee.
+
+> **Why the key includes recipient and not just tenant:** if the key were just `acme`, *every*
+> message for that customer would land on one partition. One partition, one consumer, no
+> parallelism — and if Acme is a big customer, that one partition is on fire while 11 sit idle.
+> That is called a **hot partition**. Including the recipient spreads 50 million distinct keys
+> evenly.
+
+### Consumer groups
+
+A **consumer group** is a team of readers sharing the work. Kafka guarantees each partition goes to
+exactly **one** member of the group.
+
+```
+consumer group "email-workers", 12 partitions, 3 pods:
+   pod-1  →  partitions 0,1,2,3
+   pod-2  →  partitions 4,5,6,7
+   pod-3  →  partitions 8,9,10,11
+
+You add a 4th pod. Kafka reassigns:
+   pod-1  →  partitions 0,1,2
+   pod-2  →  partitions 3,4,5
+   pod-3  →  partitions 6,7,8
+   pod-4  →  partitions 9,10,11
+```
+
+That reassignment is called a **rebalance**. Processing pauses briefly while it happens. This is how
+you scale: add pods, get more throughput, up to the partition count.
+
+### Consumer lag
+
+If producers write 1,000 messages/second and consumers read 800/second, the gap grows:
+
+```
+producer has written up to offset:  5,000,000
+consumer has read up to offset:     4,999,200
+                          lag  =          800 messages behind
+```
+
+**Lag is the single most important number in the system.** It tells you whether you are keeping up.
+We autoscale on it and alert on it.
+
+### The FIFO trap — the most important thing on this page
+
+A partition is strictly **first-in, first-out**. There is no "read the urgent one first".
+
+Now picture this:
+
+```
+partition 3 of the email topic:
+
+  [marketing msg 1] [marketing msg 2] ... [marketing msg 8,999,999] [PRIYA'S OTP]
+   ↑
+   consumer is here
+```
+
+Marketing sent 9 million campaign emails. Priya's OTP is behind all of them. The consumer processes
+200 messages/second.
+
+```
+9,000,000 ÷ 200 per second = 45,000 seconds = 12.5 HOURS
+```
+
+Priya's OTP arrives half a day late. It is worthless.
+
+**"Just add a priority field and sort by it" does not work.** There is no sorting in a partition.
+The consumer physically has to read message 1, then 2, then 3. It cannot skip ahead.
+
+**The only fix is separate files.** So we have:
+
+```
+notification.dispatch.email.tx      ← OTPs, receipts. Almost always empty.
+notification.dispatch.email.bulk    ← campaigns. Can be 9 million deep. Nobody cares.
+```
+
+Different topics, different consumers. Priya's OTP is never behind marketing, structurally.
+
+**This is the single design decision most worth being able to explain.**
+
+## 2.2 Redis (we use Valkey, which is the same thing)
+
+### What it is
+
+A dictionary that lives in memory on a server, shared by all your pods.
+
+```
+SET user:9f2a:name "Priya"       → stores it
+GET user:9f2a:name               → returns "Priya"      (about 0.2 milliseconds)
+```
+
+PostgreSQL would take 2–5 milliseconds for the same thing. Twenty times slower — which does not
+matter once, but matters enormously twenty million times a day.
+
+### The four commands we actually use
+
+**1. `SET key value NX EX 86400`** — "set this, but only if it does not already exist, and delete it
+after 86,400 seconds (24 hours)."
+
+`NX` means **"only if new"**, and it is atomic — if 100 pods run it simultaneously, exactly one
+succeeds. That is how we do idempotency and locking:
+
+```
+pod-1:  SET idem:acme:order-4821 "claimed" NX EX 86400   → OK      ← this pod won
+pod-2:  SET idem:acme:order-4821 "claimed" NX EX 86400   → (nil)   ← already taken
+pod-3:  SET idem:acme:order-4821 "claimed" NX EX 86400   → (nil)
+```
+
+**2. `INCR key`** — atomically add one. Used for counting:
+
+```
+INCR sent:u_9f2a:2026-08-31   → 1
+INCR sent:u_9f2a:2026-08-31   → 2
+INCR sent:u_9f2a:2026-08-31   → 3      ← Priya has had 3 notifications today
+```
+
+If her limit is 5, we check this before sending. Doing the same thing with a Postgres
+`UPDATE counters SET n = n + 1` would make every send for Priya queue behind a single row lock.
+
+**3. `HGETALL key`** — get a whole record at once:
+
+```
+HGETALL pref:u_9f2a
+  → { "email": "true", "sms": "false", "quietFrom": "22:00", "tz": "Asia/Kolkata" }
+```
+
+Priya's preferences change maybe once a year but are read on every send. Perfect cache candidate.
+
+**4. `ZADD` / `ZRANGEBYSCORE`** — a sorted list. Used for scheduling:
+
+```
+ZADD due 1756640000 "notif-abc"      ← due at that unix timestamp
+ZADD due 1756640060 "notif-def"
+ZADD due 1756640120 "notif-ghi"
+
+ZRANGEBYSCORE due -inf 1756640070    ← "what is due now?"
+  → ["notif-abc", "notif-def"]
+```
+
+### The rule you must state
+
+> **Redis is a cache and a coordinator. It is never the source of truth.**
+
+Everything in Redis can be rebuilt from PostgreSQL. If Redis dies at 3am, we get slower and a bit
+sloppier — not wrong. Redis's default persistence can lose one second of writes, which at our volume
+is thousands of records. That is fine for a cache and unacceptable for a ledger.
+
+## 2.3 PostgreSQL partitioning
+
+### The problem
+
+The `notification` table gets 100 million rows a day. After 90 days that is 9 billion rows. You need
+to delete the old ones.
+
+```sql
+DELETE FROM notification WHERE created_at < now() - interval '90 days';
+```
+
+This is a disaster, and here is precisely why.
+
+PostgreSQL does not erase a deleted row. It marks it dead and leaves it in place. A background
+process called **autovacuum** reclaims the space later. So:
+
+- Deleting 100 million rows creates **100 million dead rows**
+- Autovacuum must scan and clean all of them
+- Meanwhile they sit in your indexes, slowing every query
+- At 100 million/day, **autovacuum never catches up**
+
+### The fix
+
+Split one logical table into many physical tables, by date:
+
+```sql
+CREATE TABLE notification (...) PARTITION BY RANGE (created_at);
+```
+
+PostgreSQL now maintains child tables behind the scenes:
+
+```
+notification                      ← you query this
+├── notification_20260829         ← rows from Aug 29 live here
+├── notification_20260830         ← Aug 30
+├── notification_20260831         ← Aug 31 (today's inserts land here)
+└── ...
+```
+
+You write `INSERT INTO notification`. PostgreSQL routes the row to the right child automatically.
+You write `SELECT ... WHERE created_at = '2026-08-30'`. PostgreSQL reads only that one child — this
+is called **partition pruning**.
+
+And retention becomes:
+
+```sql
+DROP TABLE notification_20260601;    -- instant. zero dead rows.
+```
+
+**One operation instead of 100 million.**
+
+### What it costs you
+
+Nothing is free. Three real costs:
+
+**1. Every unique constraint must include the partition column.**
+
+```sql
+PRIMARY KEY (created_at, id)     -- not just (id)
+```
+
+Because PostgreSQL cannot check uniqueness across 90 separate tables efficiently. Consequence:
+**the database cannot guarantee `id` is globally unique.** We rely on UUID randomness for that, and
+we say so out loud rather than pretending.
+
+**2. Queries must include the date, or they scan every partition.**
+
+```sql
+SELECT * FROM notification WHERE id = 'abc';
+   → scans ALL 90 child tables
+
+SELECT * FROM notification WHERE id = 'abc'
+   AND created_at >= '2026-08-31' AND created_at < '2026-09-01';
+   → scans ONE child table.   7 buffers, 0.476 ms (measured)
+```
+
+**We solve this with the ID itself.** We use UUIDv7, which embeds a timestamp in the first 48 bits:
+
+```
+01998f2a-7c31-7a04-9e12-6f0b3c1d5a89
+└──────┬─────┘
+  this is the creation time, in milliseconds
+```
+
+So given only the ID, the code extracts the timestamp and adds the date filter automatically. **The
+key carries its own partition hint.** A random UUIDv4 could not do this.
+
+**3. Foreign keys become expensive.**
+
+An FK from another table into `notification` forces PostgreSQL to validate references when you
+detach a partition — turning an instant operation into a full scan. So the six high-volume tables
+have **no foreign keys**, and we run a nightly reconciliation job instead. This is a real trade-off,
+and being able to explain it is the point.
+
+## 2.4 Idempotency
+
+### The word
+
+"Doing it twice has the same effect as doing it once."
+
+```
+Not idempotent:   balance = balance + 100     ← run twice, you get +200
+Idempotent:       balance = 500               ← run twice, still 500
+```
+
+### Why it matters here
+
+Networks lose responses. Here is the exact sequence:
+
+```
+1. Orders service:  POST /notifications  {"userId": "u_9f2a", ...}
+2. Our API:         creates it, sends the email, returns 202
+3. The response is lost in the network
+4. Orders service:  never saw a reply, so it retries
+5. Our API:         creates it AGAIN, sends the email AGAIN
+6. Priya gets two emails
+```
+
+Step 3 is not exotic. It happens constantly at scale.
+
+### The fix
+
+The caller sends a key they generate:
+
+```http
+POST /v1/notifications
+Idempotency-Key: order-4821-shipped
+```
+
+We record it. Second request with the same key → return the first response, send nothing.
+
+### The part most implementations get wrong
+
+What if the same key arrives with a **different body**?
+
+```
+Key "order-4821-shipped" + body {"orderId": "A-4821"}    → we process it
+Key "order-4821-shipped" + body {"orderId": "B-9999"}    → ???
+```
+
+Returning the first response would be **silently answering a different question**. The caller
+believes B-9999 was sent. It never was.
+
+So we store a fingerprint of the body:
+
+```java
+byte[] fingerprint = sha256(canonicalJson(requestBody));
+```
+
+| Situation | Response |
+|---|---|
+| New key | Process it, store the response for 24 hours |
+| Same key, **same** fingerprint | Return the stored response. Send nothing. |
+| Same key, **different** fingerprint | **409 Conflict** |
+
+**Be able to say this one.** It is a small detail that signals you have actually built an API rather
+than read about one.
+
+---
+
+# PART 3 — Follow one notification through the system
+
+Priya's order shipped. Let's watch.
+
+## Step 1 — The call arrives
+
+```http
+POST /v1/notifications
+Authorization: Bearer eyJhbGc...
+Idempotency-Key: order-4821-shipped
+Content-Type: application/json
+
+{
+  "trafficClass": "TRANSACTIONAL",
+  "channels": ["EMAIL"],
+  "template": { "code": "order-shipped", "locale": "en-IN" },
+  "recipients": { "kind": "USER_IDS", "userIds": ["u_9f2a"] },
+  "variables": { "orderId": "A-4821", "eta": "2026-09-02" }
+}
+```
+
+## Step 2 — Check the idempotency key
+
+```
+Redis:  GET idem:acme:order-4821-shipped
+        → (nil)                              ← not seen before
+```
+
+Cache miss, so check the durable record too:
+
+```sql
+INSERT INTO notif.idempotency_record
+  (tenant_id, idempotency_key, created_at, request_fingerprint, state)
+VALUES (1, 'order-4821-shipped', now(), '\xa3f2...', 'IN_PROGRESS')
+ON CONFLICT DO NOTHING;
+-- 1 row inserted → we own this key
+```
+
+If that had returned 0 rows, someone else got there first and we would return `409` or the stored
+response.
+
+## Step 3 — Check the quota
+
+```
+Redis:  token bucket for tenant "acme"
+        → 847 tokens remaining of 1000/sec.  Allowed.
+```
+
+> If Redis were down, we **allow the request anyway** and log it. Rejecting a paying customer
+> because a cache is unavailable is the wrong trade. This is called **failing open**, and we do it
+> for quota but never for correctness.
+
+## Step 4 — The one transaction that matters
+
+```sql
+BEGIN;
+
+INSERT INTO notif.notification_request
+  (id, created_at, tenant_id, idempotency_key, traffic_class, channels,
+   schedule_type, recipient_source, recipient_count, template_code, payload, expires_at)
+VALUES
+  ('01998f2a-...-5a88', now(), 1, 'order-4821-shipped', 'TRANSACTIONAL', '{EMAIL}',
+   'IMMEDIATE', 'USER_IDS', 1, 'order-shipped', '{"orderId":"A-4821"}',
+   now() + interval '24 hours');
+
+INSERT INTO notif.notification
+  (id, created_at, request_id, tenant_id, channel, traffic_class,
+   status, status_rank, expires_at)
+VALUES
+  ('01998f2a-...-5a89', now(), '01998f2a-...-5a88', 1, 'EMAIL', 'TRANSACTIONAL',
+   'PENDING', 10, now() + interval '24 hours');
+
+INSERT INTO notif.outbox_message
+  (aggregate_type, aggregate_id, event_type, topic, partition_key, payload)
+VALUES
+  ('notification', '01998f2a-...-5a89', 'NotificationRequested',
+   'notification.requested', 'acme|order-4821-shipped', '{...}');
+
+COMMIT;    ← ★ THIS is the promise
+```
+
+**Three inserts, one commit.** Either all three exist or none do. That single commit is the entire
+guarantee behind "we will never lose your notification".
+
+That third insert — `outbox_message` — is the important one, and Part 4 explains why.
+
+## Step 5 — Answer the caller
+
+```json
+HTTP 202 Accepted
+{
+  "notificationRequestId": "01998f2a-7c31-7a04-9e12-6f0b3c1d5a88",
+  "status": "ACCEPTED",
+  "notifications": [
+    { "id": "01998f2a-7c31-7a04-9e12-6f0b3c1d5a89", "channel": "EMAIL", "status": "ACCEPTED" }
+  ]
+}
+```
+
+`202`, not `200`. `200` would mean "done"; nothing has been sent yet. `202` means "I have accepted
+responsibility for this."
+
+Elapsed so far: **about 40 milliseconds.** The orders service moves on.
+
+## Step 6 — Publish to Kafka (after the commit)
+
+```java
+// best-effort. If this fails, the outbox sweeper catches it within ~2 seconds.
+kafka.send("notification.requested", "acme|order-4821-shipped", event);
+```
+
+## Step 7 — The orchestrator picks it up
+
+A worker pod is subscribed to `notification.requested`. Kafka hands it the message.
+
+```
+a) Have I seen eventId 7c31-...-a04 before?
+      Redis: SET seen:7c31...a04 1 NX EX 604800  → OK, first time
+
+b) Preferences:
+      Redis: HGETALL pref:u_9f2a
+      → { email: true, quietFrom: "22:00", quietTo: "07:00", tz: "Asia/Kolkata" }
+      It is 14:30 in Kolkata. Not quiet hours. Not opted out. Proceed.
+
+c) Suppression list: is her address bounced or unsubscribed?  No.
+
+d) Frequency cap: INCR sent:u_9f2a:2026-08-31 → 3.  Limit is 5.  Proceed.
+
+e) Render the template:
+      "Hi Priya, your order A-4821 has shipped and arrives 2026-09-02."
+
+f) Publish one dispatch message per recipient:
+      topic: notification.dispatch.email.tx        ← the TX lane, because TRANSACTIONAL
+      key:   acme|u_9f2a|EMAIL
+```
+
+Note step (b): preferences are checked **here**, not at step 4. If Priya opted out one second after
+the API call, we catch it. Opt-out always wins.
+
+## Step 8 — The email worker sends it
+
+```
+a) Choose a provider:
+      candidates for EMAIL:
+        mock-email-primary    circuit CLOSED, success 99.4%, cost 100 µ,  p95 240ms
+        mock-email-secondary  circuit CLOSED, success 98.1%, cost 180 µ,  p95 310ms
+      → primary wins on score
+
+b) ★ WRITE THE ATTEMPT BEFORE CALLING OUT ★
+      INSERT INTO delivery_attempt
+        (recipient_id, attempt_no, provider_id, idempotency_token, state, request_started_at)
+      VALUES ('...5a90', 1, 2, 'tok-01998f2a-1', 'PENDING', now());
+      COMMIT;
+
+c) Call the provider (through tracing → metrics → circuit breaker → rate limit → timeout):
+      POST https://email-provider/send
+      → 202 { "messageId": "SES-9f3a2b" }   (212 ms)
+
+d) Record the outcome:
+      UPDATE delivery_attempt SET state='SUCCEEDED', provider_message_id='SES-9f3a2b',
+                                  latency_ms=212, response_at=now()
+      UPDATE notification_recipient SET status='SENT', status_rank=60,
+                                        provider_message_id='SES-9f3a2b'
+
+e) Publish a status event to Kafka.
+```
+
+**Step (b) is the one to remember.** We write "I am about to call the provider" to the database and
+commit it *before* making the call. Part 4 shows exactly why.
+
+## Step 9 — The provider calls us back
+
+Forty seconds later:
+
+```http
+POST /v1/webhooks/mock-email-primary
+X-Signature: sha256=4a7f...
+X-Timestamp: 1756640081
+
+{ "messageId": "SES-9f3a2b", "event": "delivered", "timestamp": "2026-08-31T14:31:21Z" }
+```
+
+Four checks, in this order:
+
+```
+1. Recompute HMAC-SHA256 over (timestamp + "." + rawBody) with our shared secret.
+   Compare with MessageDigest.isEqual — NOT String.equals.
+   (String.equals returns early on the first differing byte. An attacker can time
+    that to guess the signature one byte at a time. Constant-time comparison cannot.)
+
+2. Is the timestamp within ±5 minutes?  Yes.
+   (Otherwise someone could capture a valid webhook and replay it forever.)
+
+3. Is the source IP on the provider's allowlist?  Yes.
+
+4. Have we seen this exact callback before?  INSERT ... ON CONFLICT (dedup_hash) DO NOTHING.
+```
+
+Then we return `200` **immediately** and process asynchronously. If we took 15 seconds to process,
+the provider would time out and retry — and we would have caused our own duplicate storm.
+
+## Step 10 — Apply the status
+
+```sql
+UPDATE notif.notification_recipient
+   SET status = 'DELIVERED', status_rank = 80, delivered_at = now()
+ WHERE id = '...5a90'
+   AND created_at >= '2026-08-31' AND created_at < '2026-09-01'   -- partition pruning
+   AND status_rank < 80;                                          -- ★ only move forwards
+-- 1 row updated
+```
+
+Done. `ACCEPTED → QUEUED → SENT → DELIVERED`, in about 41 seconds end to end.
+
+That `status_rank < 80` clause is the subject of failure #6 below.
+
+---
+
+# PART 4 — Now break it
+
+Eight failures. For each: what happens, what would go wrong naively, and what we actually do.
+
+## Failure 1 — The API pod dies between the database write and Kafka
+
+Naive code:
+
+```java
+notificationRepo.save(notification);   // committed
+kafka.send(event);                     // ← pod killed here
+```
+
+**Result:** the notification sits in the database marked `PENDING` forever. The customer was told
+"accepted". Nothing was sent. **Nobody will ever notice** — there is no error, no alert, just a row
+that quietly never progresses.
+
+This is called the **dual write problem**: two systems, two writes, no shared transaction.
+
+### What we do
+
+Look at step 4 again. The third insert was `outbox_message` — in the **same transaction**.
+
+```
+Transaction commits:
+   notification row     ✓
+   outbox_message row   ✓        ← "someone still needs to publish this"
+
+Pod dies. Both rows are safely on disk.
+
+Two seconds later, the outbox sweeper runs:
+   SELECT * FROM outbox_message WHERE published_at IS NULL
+     ORDER BY id LIMIT 500 FOR UPDATE SKIP LOCKED;
+   → finds our row
+   → publishes to Kafka
+   → DELETEs the row
+```
+
+**The commit is a single atomic decision.** Either both rows exist or neither does. There is no
+window where we have promised something we cannot deliver.
+
+> "But doesn't the sweeper add delay?" Yes, which is why the API *also* publishes immediately after
+> the commit as a fast path. The sweeper only catches what the fast path missed. If both run and the
+> message is published twice, that is harmless — the consumer deduplicates on `eventId`.
+
+## Failure 2 — Kafka redelivers the same message
+
+The worker processed a message, then crashed before telling Kafka "I'm done with offset 4,821".
+Kafka's bookmark still says 4,820, so it hands the same message to another pod.
+
+**Naive result:** Priya gets two emails.
+
+### What we do
+
+Every message carries an `eventId`. The first thing a consumer does:
+
+```java
+boolean firstTime = redis.setIfAbsent("seen:" + eventId, "1", Duration.ofDays(7));
+if (!firstTime) {
+    ack();       // already handled this
+    return;
+}
+```
+
+Second delivery finds the key already set, acknowledges, and does nothing.
+
+We also **always commit the Kafka offset after the database write, never before.** That way the
+worst case is redelivery (safe) rather than loss (not safe).
+
+## Failure 3 — The worker dies mid-send
+
+The hardest one in the system.
+
+```
+t=0ms     worker calls the email provider
+t=50ms    the provider receives it and starts sending
+t=51ms    ★ the pod is killed (OOM, deploy, spot eviction) ★
+t=2000ms  Kafka redelivers to another pod
+t=2001ms  that pod calls the provider again
+          → Priya gets two emails
+```
+
+The redelivered pod has no idea a call was ever made. There is no record.
+
+### What we do — write the intent first
+
+Look at step 8(b) again:
+
+```java
+attemptRepo.save(new Attempt(recipientId, 1, PENDING, token));   // ★ COMMITTED
+provider.send(payload, token);                                    // now safe to die
+attemptRepo.markSucceeded(...);
+```
+
+Now the crash leaves evidence:
+
+```sql
+SELECT * FROM delivery_attempt WHERE recipient_id = '...5a90';
+
+ attempt_no | state   | request_started_at   | response_at
+------------+---------+----------------------+-------------
+          1 | PENDING | 2026-08-31 14:30:41  | NULL          ← we called out, and never came back
+```
+
+The recovering pod sees `PENDING` with a `NULL` response and an age past the timeout. It does
+**not** blindly resend. It moves the attempt to `UNKNOWN` and waits for reconciliation.
+
+**Committing a row before making a network call turns an invisible failure into a visible one.**
+That is the whole technique.
+
+## Failure 4 — The provider times out, but actually delivered
+
+No crash this time. Just slow.
+
+```
+t=0ms     we call the provider
+t=5000ms  our client times out. We record a failure.
+t=5200ms  the provider actually finishes sending. Priya has the email.
+```
+
+We think it failed. It succeeded. **If we retry, Priya gets two.**
+
+And here is the part that makes this genuinely hard, which we verified rather than assumed:
+
+| Provider | Can we send them a deduplication key? | Can we ask "did you send my message X?" |
+|---|---|---|
+| Twilio | **No** | **No** — the API has no client-reference field at all |
+| Amazon SES | No | Yes, via message tags |
+| SendGrid | No | Yes, via `custom_args` |
+| FCM (Android push) | No | No per-message receipt |
+| APNs (iOS push) | No — `apns-id` is for *error reporting*, not deduplication | No |
+
+**Not one of them offers a usable client idempotency key.** So "exactly-once delivery" is not
+something we can build. Anyone who claims it has not checked.
+
+### What we do — different answers per channel, based on cost
+
+| Channel | On timeout | Why |
+|---|---|---|
+| **SMS** | **Do not resend.** Accept a small, measured loss rate. | A duplicate OTP costs money and user trust, and Twilio cannot be queried to find out what happened. A lost OTP is recoverable — the user taps "resend". A duplicate is not. |
+| **Email** | Retry, then reconcile via `custom_args` | Duplicates are nearly free and reconciliation actually works |
+| **Push** | Retry, with a collapse key | The collapse key makes a duplicate **replace** the first notification on the device instead of stacking |
+
+Being able to say *"we chose at-most-once for SMS and at-least-once for email, and here is why"* is
+worth more in an interview than any amount of architecture vocabulary.
+
+## Failure 5 — The provider goes down completely
+
+Every call fails. Naively you retry, and now you are sending 10,000 requests/second to a service
+that is already on fire.
+
+### What we do, in four parts
+
+**Part 1 — classify before reacting.**
+
+```java
+switch (failureType) {
+    case TRANSIENT_NETWORK, PROVIDER_5XX -> retry();
+    case RATE_LIMITED                    -> retryAfter(header);
+    case INVALID_RECIPIENT               -> fail();       // never works
+    case UNSUBSCRIBED                    -> suppressForever();
+    case AUTH_FAILURE                    -> failover(); pageOnCall();
+}
+```
+
+Retrying an invalid phone number five times helps nobody. Not retrying a socket reset loses a
+message that would have worked. They are indistinguishable unless you classify.
+
+**Part 2 — back off with randomness.**
+
+```java
+delay = min(cap, initial * pow(2, attempt));
+actualDelay = random(0, delay);          // ← full jitter
+```
+
+The randomness is the point:
+
+```
+Without jitter: 100,000 messages fail at 14:30:00
+                → ALL 100,000 retry at exactly 14:30:02
+                → the provider, just recovering, dies again
+
+With jitter:    the same 100,000 spread evenly across 0–2 seconds
+                → the provider recovers
+```
+
+**Part 3 — stop calling a dead service.** After 20 calls with >50% failures in 60 seconds, the
+circuit **opens** and we stop trying for 30 seconds, then send a few probes.
+
+Two details worth mentioning:
+
+- The circuit state is stored in **Redis**, so all 40 pods know at once instead of each discovering
+  it independently — that is 40× the damage otherwise.
+- The 30-second wait is **jittered per pod**. Otherwise 40 pods × 10 probes = 400 simultaneous
+  probes hit the recovering provider — the exact stampede the breaker was meant to prevent,
+  recreated by having more than one instance.
+
+**Part 4 — use a different provider.** Score the candidates and pick the next one.
+
+## Failure 6 — The webhook arrives out of order
+
+Two different systems write status:
+
+```
+14:31:20.100   the provider's webhook says DELIVERED   ← arrives first
+14:31:20.400   our own worker writes SENT              ← slower
+```
+
+**Naive result:** the record ends up saying `SENT`. Delivery metrics are wrong. If retries are
+driven off status, we resend something the user already has.
+
+### What we do — statuses have a rank, and only move up
+
+```
+PENDING 10  →  QUEUED 30  →  SENT 60  →  DELIVERED 80
+```
+
+```sql
+UPDATE notification_recipient SET status = 'SENT', status_rank = 60
+ WHERE id = '...' AND status_rank < 60;
+-- 0 rows updated   ← stored rank is already 80. Dropped.
+```
+
+**Zero rows is not an error.** It means the event was stale or duplicated, which is normal at
+volume. We log it as an unapplied event and move on.
+
+Two rank choices carry real business rules:
+
+```
+CANCELLED = 28   <   QUEUED = 30
+```
+"You cannot cancel something already queued" is now enforced by the *ordering*. No `if` statement
+for a future engineer to forget. And the opposite race is also safe: if `CANCELLED` commits first it
+is terminal, so the racing `QUEUED` is rejected by the terminal check.
+
+```
+DELIVERED = 80, and it is NOT terminal
+```
+Because an SMTP "250 OK" means *accepted*, not *in the inbox*. A hard bounce legitimately arrives
+afterwards. Systems that treat delivered as final silently discard bounce events — so the address
+never reaches the suppression list, and you keep mailing a dead mailbox until your sender reputation
+is ruined.
+
+## Failure 7 — Twenty scheduler pods fight over the same rows
+
+Scheduled notifications live in a table. Every pod runs:
+
+```sql
+SELECT * FROM scheduled_notification
+ WHERE due_at <= now() LIMIT 500 FOR UPDATE;
+```
+
+All twenty walk the same index in the same order. Pod 1 locks the rows; pods 2–20 wait.
+
+**We measured this**, 16 concurrent claimers against 3 million rows:
+
+| Approach | Throughput | Latency |
+|---|---|---|
+| Plain `FOR UPDATE` | **159/sec** | 100.5 ms |
+| Add `SKIP LOCKED` | 453/sec | 35.3 ms |
+| **Each pod owns its own shards** | **746/sec** | **21.5 ms** |
+
+Note the naive version produces **no errors and no deadlocks**. It just serialises. Which is why it
+presents as "the database is slow" rather than as a design bug — the hardest kind of problem to
+find.
+
+### What we do
+
+- **Sharding**: 256 shards spread across pods. Pod 3 only looks at its own shards, so pods never
+  contend.
+- **A lease, not a lock**: `claimed_until = now() + 60s`. A dead pod's work is reclaimed in a
+  minute.
+- **A claim counter**: if a row has been claimed six times, it is killing a worker every time.
+  Send it to the dead-letter queue instead of claiming it a seventh time. Without this, one bad row
+  crash-loops a pod forever and never appears in any metric.
+
+## Failure 8 — Everything fires at 09:00:00
+
+Humans schedule things on the hour. About 5% of a day's scheduled volume lands in a single minute:
+**20,833 per second**.
+
+### What we do
+
+```java
+dueAt = dueAt.plusSeconds(Math.floorMod(notificationId.hashCode(), 300));
+```
+
+One line. Spreads a 60-second cliff across 5 minutes: **20,833/sec → 4,167/sec.**
+
+It uses `hashCode()` rather than a random number **deliberately** — the same ID always gets the same
+offset, so it survives restarts and stays idempotent. A random jitter would move the send time every
+time the row was reprocessed.
+
+Google's own FCM documentation independently warns you to *"avoid sending messages within a 2 minute
+window of each of the :00, :15, :30, and :45 minute marks"* — the same problem, observed from the
+receiving end.
+
+---
+
+# PART 5 — Explaining it
+
+## 5.1 If you get 60 seconds
+
+> "It's a notification platform — SMS, email and push — for 50 million users.
+>
+> A service calls our API. We write the notification and an outbox row in a single database
+> transaction and return 202 immediately, so one commit is the whole guarantee that nothing is lost.
+> Everything after that is asynchronous through Kafka, so a campaign to ten million people doesn't
+> block the caller.
+>
+> Workers check preferences, render the template, and send through whichever provider is currently
+> healthiest and cheapest. If one fails, a circuit breaker opens and we fail over. Failures get
+> classified before we retry — a socket reset gets exponential backoff with jitter, an invalid
+> phone number never gets retried at all.
+>
+> Delivery receipts come back by webhook and go through a state machine that only moves forwards,
+> so out-of-order and duplicate callbacks are safe.
+>
+> The thing I'd call out is that I split traffic into separate Kafka topics by priority — because
+> partitions are strictly FIFO, so a priority *field* doesn't actually work. A marketing blast
+> would otherwise sit in front of a login OTP."
+
+## 5.2 If they ask "why is this hard?"
+
+Pick two of these. Do not list all eight.
+
+1. **A campaign is 12× normal load, on demand.** Averages don't size the system; a 10-million-recipient blast landing on the evening peak does.
+2. **The provider can time out after succeeding.** Neither retrying nor giving up is correct, and no major provider offers a deduplication key.
+3. **Webhooks arrive out of order,** so naive status updates corrupt your data routinely, not rarely.
+4. **The first bottleneck isn't yours.** Provider accounts cap around 200–500 messages/second, which you hit at ~17 million/day — long before any AWS limit.
+
+## 5.3 Numbers worth memorising
+
+| | |
+|---|---|
+| Users / volume | 50M users, 5M–100M notifications/day |
+| Campaign burst | **14,583/sec** — the number the system is sized for |
+| Kafka | 16 topics, 288 partitions |
+| Due-scan improvement | **159 → 746 transactions/sec** |
+| Provider health query | 290 ms → **0.015 ms** via a rollup table |
+| Cost reality | AWS ~$30k/month vs **provider fees ~$2.46M/month** |
+
+That last one is the best single line you have: **AWS is 1.2% of total cost.** A 20% shift from SMS
+to push saves 15× the entire AWS bill. It shows you optimised the thing that mattered rather than
+the thing that was fun.
+
+## 5.4 Things not to say
+
+| Don't | Do |
+|---|---|
+| "It guarantees exactly-once delivery" | "Exactly-once isn't achievable across a network to a third party. Transport is at-least-once, dispatch is idempotent, and I measure the duplicate rate." |
+| "It uses Kafka, Redis and Postgres" | "I used Kafka for replay and per-key ordering; RabbitMQ deletes on ack so a bad deploy would be unrecoverable." |
+| "It handles millions of notifications" | "It's sized for a 14,583/second campaign burst, which is 12× the daily average." |
+| "It's complete" | "The design is complete, the core is built and tested, and here's what I'd do next." |
+
+---
+
+# Appendix — one-line glossary
+
+| Term | Meaning |
+|---|---|
+| **Topic** | A named log in Kafka |
+| **Partition** | One ordered slice of a topic; the unit of parallelism |
+| **Offset** | A message's position in a partition |
+| **Consumer group** | A team of readers sharing partitions; each partition goes to exactly one member |
+| **Consumer lag** | How many messages behind a consumer is |
+| **Rebalance** | Kafka reassigning partitions when members join or leave |
+| **Idempotent** | Doing it twice has the same effect as once |
+| **At-least-once** | May arrive more than once, never zero times |
+| **Exactly-once** | Not achievable across a network to a third party |
+| **Outbox** | A row written in the same transaction, published separately |
+| **Circuit breaker** | Stop calling a service that is clearly failing |
+| **Jitter** | Randomness added to retry delays so clients don't synchronise |
+| **Head-of-line blocking** | One stuck message holding up everything behind it |
+| **Partition (Postgres)** | A child table holding one slice of a big table, usually by date |
+| **Partition pruning** | Postgres reading only the child tables a query needs |
+| **HOT update** | Postgres updating a row in place because no indexed column changed |
+| **Dead-letter queue** | Where messages go when retries are exhausted |
+| **Backpressure** | Slowing intake because downstream can't keep up |
+| **SLI / SLO** | What you measure / the target for it |
+| **Error budget** | How much you're allowed to miss the SLO by |
