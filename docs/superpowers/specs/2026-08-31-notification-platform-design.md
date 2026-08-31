@@ -841,10 +841,31 @@ Alarm on `max(partition_lag) / mean(partition_lag) > 3` sustained 5 min.
 | 4 | Attempt registration | `(recipient_id, attempt_number)` UNIQUE | Postgres, **before** the call | permanent | Worker crash mid-send |
 | 5 | Provider dispatch | `idempotency_token` sent to the provider | Postgres UNIQUE | provider | **Provider ACKed and we never saw it** |
 
-Only layer 5 can prevent a genuine duplicate, and only where the provider supports it
-(SNS FIFO `MessageDeduplicationId`, APNs `apns-id`, FCM `collapse_key`; Twilio and SES have no
-client key). Where none exists we degrade honestly to `UNKNOWN` + reconciliation, and **measure**
-the duplicate rate rather than claiming zero.
+**Verified provider reality (2026-08-31) — the table most designs get wrong:**
+
+| Provider | Client idempotency key | Reconciliation by our reference |
+|---|---|---|
+| Twilio SMS | **NO** | **NO** — `GET /Messages` filters only on `To`/`From`/`DateSent` at *whole-day* granularity, and there is **no client-reference field on Messages** |
+| AWS SNS | Partial — FIFO only, `MessageDeduplicationId`, 5-min minimum window | via SQS |
+| AWS SES | **NO** | Yes — `EmailTags`. AWS explicitly documents that a timeout may follow acceptance and a retry sends a **second email with a different message ID** |
+| SendGrid | **NO** | Yes — `custom_args` echoed on every Event Webhook payload |
+| FCM HTTP v1 | **NO** (open feature request since 2018) | **NO** per-message receipt — aggregate Data API only, up to **5 days** lag, sampled |
+| APNs | **NO** — `apns-id` is **correlation for error reporting only**; Apple never states it suppresses a repeat | **NO** — no webhook at all, only aggregate console metrics |
+
+**No provider we would plausibly integrate offers a usable client idempotency key.** Layer 5 is
+therefore *aspirational* rather than universal, and the design must not assume it.
+
+**Consequence — delivery semantics differ per channel by cost asymmetry:**
+
+| Channel | Duplicate cost | Semantic on `UNKNOWN` |
+|---|---|---|
+| **SMS** | Real money, user trust, carrier spam flags — and **no way to reconcile on Twilio** | **At-most-once.** Do **not** resend. Accept a small, *measured* loss rate: a lost OTP is recoverable by the user retrying; a duplicate OTP is not recoverable at all |
+| **Email** | Negligible cost, exact reconciliation available via `custom_args` / `EmailTags` | At-least-once + reconcile |
+| **Push** | ~zero | At-least-once, with `apns-collapse-id` / `collapse_key` set to our dedup key so a duplicate **replaces** rather than stacks, plus client-side dedup on a payload `notificationId` |
+
+An idempotency key converts duplicate risk into *loss* risk; the ledger plus reconciler converts
+it back — but only where reconciliation is actually possible. We state per channel which one we
+have chosen and why, rather than claiming a uniform guarantee.
 
 The `request_fingerprint` (SHA-256 of the canonical body) is what most implementations skip:
 same key + **different** body must be `409`, not a silent replay of an unrelated response.
@@ -1288,7 +1309,16 @@ Mocks emulate real vendor **semantics**, not generic success:
 |---|---|---|
 | `MockSmsProvider` | Twilio | Codes `21610`/`21614`/`20429`/`30003`; async `MessageStatus` callback; **no client idempotency key** → forces the `UNKNOWN` path |
 | `MockEmailProvider` | Amazon SES | 50-destination bulk, per-destination results, `Throttling`, `Permanent/General` bounce, complaint feedback loop |
-| `MockPushProvider` | FCM v1 + APNs | **500-token multicast cap**, `UNREGISTERED` → deactivate token, `QUOTA_EXCEEDED`, `apns-collapse-id`, partial success |
+| `MockPushProvider` | FCM v1 + APNs | `UNREGISTERED` → deactivate token, `QUOTA_EXCEEDED` (429 with a **1-minute minimum** initial delay), `apns-collapse-id`, per-token partial success, **410 body carrying the `timestamp` at which the token went invalid** |
+
+> **FCM has no batch endpoint.** The `/batch` API was deprecated 2023-06-21 and **stopped working
+> 2024-06-21**. `sendEachForMulticast` fans out to *individual HTTP/2 requests*; 500 is a
+> client-side chunking limit, not a server batch. The mock reproduces this — one request per
+> token — so connection-pool sizing is exercised honestly rather than hidden behind a fake batch
+> call. Likewise FCM's documented guidance is treated as hard requirement: ≥10 s timeout before
+> retry, ≥10 s before re-attempt, honour `Retry-After` (default 60 s if absent), and **avoid
+> sending within 2 minutes of the :00/:15/:30/:45 marks** — which is an independent argument for
+> the scheduler jitter in §2.3.
 
 **Deterministic failure injection** — seeded RNG so CI can assert "exactly 3 messages reached
 the DLQ"; log-normal latency (real latency is long-tailed; uniform never trips a p99 breaker
@@ -1473,7 +1503,207 @@ milestone traps (AssertJ 4.0.0-M1, Micrometer 1.18.0-M1, MapStruct 1.7.0.Beta2, 
 
 ---
 
-## 22. Open Items
+## 22. Refinements from Production Research
+
+Eight changes derived from primary-source research into how Uber, Netflix, LinkedIn, Slack,
+Airbnb, DoorDash, Pinterest and Twitter actually operate systems of this shape. Each names the
+failure it prevents.
+
+### 22.1 Retry budget — a token bucket, not just a circuit breaker
+
+AWS explicitly dissents on circuit breakers: *"circuit breakers introduce modal behavior into
+systems that can be difficult to test, and can introduce significant addition time to recovery.
+We have found that we can mitigate this risk by limiting retries locally using a token bucket."*
+Netflix agrees implicitly — **Hystrix is retired**, redirected to adaptive concurrency limits.
+
+Four independent designs converge on the same number: Google SRE 10%, gRPC `retryThrottling`
+≈10%, Envoy `budget_percent` default 20%, AWS ~22%. **We adopt a 10% per-JVM retry token budget**
+alongside the circuit breaker. Retries are, in AWS's phrasing, *"selfish"* — they can delay
+recovery by keeping load high long after the original issue resolved.
+
+Sizing context: Segment measured that **~1.5% of all deliveries succeed on a retry** that failed
+first time. Retries are worth having and are **not** worth an unbounded budget.
+
+**Retry in exactly one layer.** AWS's worked example: a five-deep stack with three retries per
+layer multiplies load on the failing dependency **243×**. Retry lives in the Kafka consumer and
+nowhere else; the provider SDK's own retry is disabled explicitly.
+
+### 22.2 The half-open stampede
+
+Resilience4j's `permittedNumberOfCallsInHalfOpenState` is **per JVM**. With 40 worker pods that
+all opened at roughly the same instant and all wait the same `waitDurationInOpenState`, the
+recovering provider receives 40 × 10 = **400 synchronised probes** — precisely the herd the
+breaker exists to prevent, reintroduced by replication.
+
+**Fix:** jitter `waitDurationInOpenState` per pod (`30s + random(0, 30s)`), and elect a probe
+cohort via the shared Valkey circuit state so only a subset probes per window.
+
+### 22.3 Lag-driven autoscaling is a feedback loop pointed the wrong way
+
+Our KEDA scalers trigger on Kafka consumer lag. During a **provider** outage: dispatch stalls →
+lag climbs → KEDA scales out → more consumers hammer the recovering provider. **Lag is a symptom
+of the provider being down, not of insufficient consumer capacity.**
+
+**Fix:** gate dispatch-worker scale-out on a provider-health signal. When the circuit for a
+channel's providers is `OPEN`, lag-based scale-out for that channel is suppressed and the
+partitions are `pause()`d instead.
+
+### 22.4 Due-scan: leader-elect the hydrator
+
+`SKIP LOCKED` fixes correctness and serialisation; it **does not fix bloat**. PlanetScale measured
+the recursive-CTE and `SKIP LOCKED` patterns side by side with *"degradation curves almost
+identical."* And a documented pgsql-general case hit a hard wall at **128 concurrent claimers on
+80 cores** — Thomas Munro's diagnosis: *"you have to skip all dead/non-matching tuples left behind
+so far at the start of the table by all the other sessions… It all gets a bit explosive."* Wasted
+index visits scale as **B·W²/2**, so raising the batch size to improve efficiency *multiplies* the
+quadratic term. Exactly the wrong lever.
+
+**Refinement to §8.6:** keep shard-affine claiming, but make the *due-scan* single-writer. River
+and Oban both leader-elect the scheduler stage and use plain `FOR UPDATE` there, reserving
+`SKIP LOCKED` for the claim step where contention is useful. Our three tiers become:
+
+1. **Postgres** — durable ledger, partitioned on the **immutable** `due_bucket`, retention by
+   `DROP PARTITION`, retry as delete-and-reinsert (never `UPDATE due_at` — a cross-partition row
+   move raises `40001`, and `SKIP LOCKED` cannot silently ignore moved tuples).
+2. **Leader-elected hydrator** — one elected pod range-scans the hot partition every H seconds
+   from **one session**, generating no dead tuples, and pushes the next 5 minutes into Valkey.
+3. **Shard-affine claimers** — read from the Valkey near-horizon; Postgres rows stay `PENDING`
+   until dispatch is acked, so a crashed hydrator loses at most H of *scheduling*, never data.
+
+This is Netflix Timestone's shape: **Redis is the index, not the ledger.**
+
+### 22.5 Quiet hours need a 15-minute tick, not hourly
+
+Measured against tzdb 2026c: **312 canonical zones but only 37 distinct UTC offsets** in force at
+any instant, with minute components in `{00, 30, 45}` — Nepal +05:45, Chatham +12:45, Eucla
++08:45. A single "09:00 local" send produces **37 distinct UTC instants spread over 25 hours**.
+Hourly ticking is wrong; **half-hourly is also wrong**. 15 minutes is necessary and sufficient.
+
+Three further findings:
+
+- **`Australia/Lord_Howe` shifts by 30 minutes**, `Antarctica/Troll` by 2 hours. Any code assuming
+  a one-hour DST delta is wrong, and Java's own javadoc says so: *"In most cases, the transition
+  duration is one hour, however this is not always the case."*
+- **2026 has 214 transitions, 82.7% of them on four calendar dates** — not "twice yearly".
+- **`ZoneRules.getOffset(LocalDateTime)` and `ZonedDateTime.of()` disagree inside a DST gap.**
+  Mixing them yields silent off-by-one-hour bugs; in a fall-back *overlap* it yields a genuine
+  double-send, because two workers resolve the same local time to instants an hour apart.
+
+**Fix:** store `zone_id` as the source of truth, materialise `next_eligible_at timestamptz`,
+**and store the resolved offset** so overlap resolution is idempotent.
+
+### 22.6 Never compute timezone-dependent values in Postgres
+
+`timezone(text, timestamp)` is marked **IMMUTABLE** in `pg_proc` — so
+`ts AT TIME ZONE 'Asia/Kolkata'` is *legal* in a generated column and an expression index, despite
+depending on bundled tzdata that changes several times a year. Postgres's own warning: *"Labeling
+a function IMMUTABLE when it really isn't might allow it to be prematurely folded to a constant…
+resulting in a stale value being re-used."*
+
+**A tzdata bump silently invalidates such an index — wrong rows returned, no error, no `amcheck`
+failure.** Several popular blog posts recommend exactly this pattern.
+
+**Fix:** compute `next_eligible_at` in Java, store a plain `timestamptz`, index that, and stamp
+each row with a **`tzdb_version`** column so a post-bump sweep is
+`WHERE tzdb_version <> $current`. Also: the JVM's bundled tzdb lags IANA by 0–3 months, there is
+no supported hot-reload, and a mid-rollout fleet with mixed versions produces duplicate *or*
+missing sends — so export `ZoneRulesProvider.getVersions("UTC")` as a per-pod gauge and **alert on
+cardinality > 1 across the fleet**.
+
+### 22.7 Kafka: adopt KIP-848 from day one
+
+We are on Kafka 4.3.1, where **KIP-848 (broker-side consumer rebalance protocol) is GA**. It
+removes the group-wide synchronisation barrier entirely, superseding the `CooperativeStickyAssignor`
+recommendation in §9.
+
+Two related operational notes:
+
+- **KIP-62 moved heartbeats to a background thread**, so a consumer stuck in a slow provider call
+  *still heartbeats and looks alive* while the `max.poll.interval.ms` clock runs out. This is why
+  a rebalance storm is invisible to liveness monitoring, and why bounding every provider call
+  strictly below the per-record budget is non-negotiable.
+- **`vm.max_map_count` defaults to 65,530.** Kafka mmaps index files, so this is a hard ceiling at
+  surprisingly modest partition counts. Raise to ≥1,000,000 in the node bootstrap.
+
+### 22.8 Alert on conjunctions, not on lag
+
+Lag alone is ambiguous. The definitive signatures:
+
+| Signature | Meaning |
+|---|---|
+| `records-lag-max` rising **AND** `commit-rate ≈ 0` | **Poison pill** — partition throughput is exactly zero while the consumer looks perfectly alive |
+| Lag flat and non-zero **AND** `records-consumed-rate = 0` | Stuck poll |
+| `rebalance-rate-per-hour` elevated **AND** `last-rebalance-seconds-ago` repeatedly resetting | Rebalance storm |
+| `records-lag-max ≫ records-lag-avg` | Partition skew / hot tenant |
+| Offered load drops **AND** error rate does not | **Metastable failure — stop scaling, start shedding** |
+
+That last one is the diagnostic that matters most. An OSDI'22 study of 22 incidents found **at
+least 4 of the 15 major AWS outages of the prior decade were metastable failures**, lasting
+1.5–73 hours, with **~50% having retry policy as the sustaining effect**. The lesson is to fix the
+*sustaining loop*, not the trigger — the next trigger will be different and the failure state
+identical.
+
+### 22.9 Cross-company convergence (validation)
+
+Five findings independently confirm choices already made:
+
+1. **Priority is physical separation, never a priority field.** Netflix (queue + cluster per
+   priority), Airbnb (consumer group + Temporal namespace per category), Uber (per-domain Priority
+   Assigner), Pinterest (Kubernetes pool per queue). Nobody operating one of these at scale uses a
+   priority field in a shared queue.
+2. **Delayed sends inside the broker are the recurring outage cause.** DoorDash **banned Celery
+   countdowns** after outages traced directly to them; Airbnb replaced Resque Scheduler; Uber built
+   hour-bucketed topics rather than use any broker delay feature.
+3. **The memory-broker ceiling.** Slack (Redis), DoorDash (RabbitMQ), Airbnb (Resque), Pinterest
+   (PinLater) all hit a single-node vertical ceiling and split into durable transport plus a
+   purpose-built scheduler. Slack's is the sharpest: *"our system actually required a bit of free
+   Redis memory in order to dequeue a job"* — you cannot scale out of that failure, and dequeue
+   cost was O(queue length), so the fuller it got the slower it drained.
+4. **Head-of-line blocking has one fix** — Uber's: redefine consumer success as *"the establishment
+   of a conclusive result"* rather than a successful handler response, and get the failure out of
+   the partition immediately.
+5. **You can cut volume and gain engagement simultaneously.** Pinterest −24% volume / +31% CTR;
+   LinkedIn −35.5% volume / −53% complaints; Twitter −5.79% sends / +7.96% open rate. **The default
+   state of a notification platform is over-sending** — which is why §22.10 exists.
+
+### 22.10 Frequency capping: build the holdout before the model
+
+Pinterest built a weekly per-user budget, proved it (−24% email volume, +31% CTR), then **replaced
+it with a threshold policy and watched unsubscribes rise**. LinkedIn's finding is the reason:
+*"unlike a positive response to an email, the scope of a negative response does not end at that
+particular email"* — an unsubscribe is an **absorbing state**, and spam complaints have
+**cross-tenant deliverability blast radius**.
+
+Three implementation requirements that are easy to miss:
+
+- **Per-cap drop attribution.** Evaluate *all* caps and record the set of binding ones — short-
+  circuiting on first rejection makes the audit record a lie. Without a per-cap drop counter you
+  cannot answer "why did volume fall 8% last Tuesday."
+- **"Exempt from cap" and "does not count toward cap" are two independent booleans**, and the
+  second must default to `false`. Braze's default is the opposite and it surprises people.
+- **A randomised holdout from day one.** Train on the *allocated budget*, not actual sends —
+  otherwise survivorship bias teaches the model that users receiving fewer notifications
+  unsubscribe more, which is exactly backwards.
+
+Storage note: **a shared Redis bitmap gives a full 30-day send history for all 50M users in
+178 MiB** — 30–140× cheaper than any per-user-key scheme, because it eliminates the ~85–110 B/key
+overhead entirely. Per-user-per-category keys are the real failure mode (10 categories × 3 windows
+× 50M users = **1.5 billion keys, ~154 GiB**).
+
+### 22.11 Source integrity
+
+Several systems cited in popular system-design material **do not exist** and are not referenced
+anywhere in this spec: a Netflix "Delivering notifications at scale" post, a DoorDash notification
+architecture post or "Asgard" service, a LinkedIn "Air Traffic Controller" *paper*, Twitter
+"DeferredRPC". Where this document cites an external system, it cites a verifiable primary source.
+
+Two live vendor facts that affect design: **AWS Pinpoint reaches EOL 2026-10-30** and **Twilio
+Notify is already EOL** — which is itself the argument against building on a vendor's multi-channel
+abstraction layer rather than on the delivery layer directly.
+
+---
+
+## 23. Open Items
 
 1. **Diagrams 1 and 6 in the Figma board predate two changes** (dispatch topics became
    channel × lane; due-scan became shard-affine). Regenerate before the repo is published.
