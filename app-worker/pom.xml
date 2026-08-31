@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>dev.gaurav.notification</groupId>
+        <artifactId>notification-platform</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+    <artifactId>app-worker</artifactId>
+    <name>App :: Worker</name>
+    <dependencies>
+        <dependency><groupId>dev.gaurav.notification</groupId><artifactId>platform-domain</artifactId></dependency>
+        <dependency><groupId>dev.gaurav.notification</groupId><artifactId>platform-application</artifactId></dependency>
+        <dependency><groupId>dev.gaurav.notification</groupId><artifactId>platform-persistence</artifactId></dependency>
+        <dependency><groupId>dev.gaurav.notification</groupId><artifactId>platform-messaging</artifactId></dependency>
+        <dependency><groupId>dev.gaurav.notification</groupId><artifactId>platform-provider</artifactId></dependency>
+        <dependency><groupId>dev.gaurav.notification</groupId><artifactId>platform-resilience</artifactId></dependency>
+        <dependency><groupId>dev.gaurav.notification</groupId><artifactId>platform-observability</artifactId></dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-actuator</artifactId></dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency>
+    </dependencies>
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration><mainClass>dev.gaurav.notification.worker.NotificationWorkerApplication</mainClass></configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
