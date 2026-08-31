@@ -1,7 +1,7 @@
 # Architecture Summary
 
 The two-page version. Full detail in [ARCHITECTURE.md](ARCHITECTURE.md) and the
-[design spec](superpowers/specs/2026-08-31-notification-platform-design.md).
+[design spec](design/DESIGN-SPEC.md).
 
 ---
 
@@ -80,18 +80,33 @@ at-least-once consumers, freely-retried webhooks and DLQ replay all safe.
 
 **AWS is 1.2% of TCO.** A 20% SMS→push down-route saves $474k/month — 15× the entire AWS bill.
 
-### Measured, not estimated
+### Reproducible from this repository
+
+Run `./scripts/capture-verification.sh` — it regenerates every figure below from live commands
+and writes the raw output to `docs/verification/`.
 
 | Thing | Result |
 |---|---|
-| Due-scan: naive `FOR UPDATE` | 159 tps, 100.5 ms latency |
-| Due-scan: `SKIP LOCKED` | 453 tps |
-| Due-scan: **shard-affine** | **746 tps, 21.5 ms** |
-| Provider success rate — raw scan | 481 MB, 290.7 ms (one day, one partition) |
-| Provider success rate — rollup table | **2 buffers, 0.015 ms** (19,000× faster) |
-| Monotonic status guard | 8 buffers, **0.041 ms** |
-| Partial retry index | **3.6 B/row** vs 40+ for a full index |
-| BRIN vs B-tree on append-only time column | **48 kB vs 120 MB** |
+| `V1__baseline.sql` on PostgreSQL 18.6 | applies clean under `ON_ERROR_STOP=1` |
+| `credentials_ref` CHECK vs a pasted API key | **rejected**; a `mock:`/ARN reference is accepted |
+| Monotonic guard — late `SENT` after `DELIVERED` | **0 rows**, dropped |
+| Monotonic guard — duplicate webhook | **0 rows**, dropped |
+| Monotonic guard — `BOUNCED` after `DELIVERED` | applied (delivered is not terminal) |
+| Monotonic guard — anything after a terminal state | **0 rows**, dropped |
+| Test suite | see `docs/verification/01-build.txt` |
+
+### Measured during design research — *not* reproducible here
+
+These came from prototypes built while designing the system, on synthetic schemas that are **not
+in this repository**. They are why the design is shaped as it is; they are **not** benchmarks of
+this code, and they should not be quoted as such.
+
+| Prototype measurement | Result | Why it is not reproducible here |
+|---|---|---|
+| Due-scan: naive `FOR UPDATE` → `SKIP LOCKED` → shard-affine | 159 → 453 → 746 tps | `notif.scheduled_notification` is not yet in a migration (see [STATUS.md](STATUS.md)) |
+| Provider success rate: raw scan vs rollup | 290.7 ms → 0.015 ms | needs a populated `delivery_attempt` at scale |
+| Partial index cost | 3.6 B/row vs 40+ | measured on a 9M-row synthetic dataset |
+| BRIN vs B-tree, append-only time column | 48 kB vs 120 MB | same dataset |
 
 ---
 

@@ -2,7 +2,7 @@
 
 Authentication, authorisation, encryption, secrets, PII, webhook verification and the threat model.
 
-Source: [§13 of the design spec](superpowers/specs/2026-08-31-notification-platform-design.md#13-security).
+Source: [§13 of the design spec](design/DESIGN-SPEC.md#13-security).
 
 > **Read this column first.** `platform-security` contains a `package-info.java` and nothing else.
 > Every control below is marked **Built**, **Partial** or **Design only**, and the honest summary is

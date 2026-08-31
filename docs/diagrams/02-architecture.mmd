@@ -1,0 +1,68 @@
+flowchart TB
+    subgraph clients [" "]
+        direction LR
+        SVC["Internal Services"]
+        CAMP["Campaign Tools"]
+    end
+    ALB["ALB + WAF"]
+    subgraph api ["app-api · stateless · HPA 3→60"]
+        direction LR
+        ACCEPT["Accept<br/>idempotency + quota"]
+        WH["Webhook Receiver<br/>HMAC verified"]
+        QRY["Query API"]
+    end
+    subgraph kafka ["Kafka · 16 topics · 288 partitions"]
+        direction LR
+        TREQ["requested"]
+        TTX["dispatch · TX lane<br/>OTPs, receipts"]
+        TBULK["dispatch · BULK lane<br/>campaigns"]
+        TRETRY["retry · 5 tiers"]
+        TSTAT["status"]
+        TDLQ["dlq"]
+    end
+    subgraph worker ["app-worker · KEDA on consumer lag"]
+        direction LR
+        ORCH["Orchestrator<br/>prefs · template · dedup"]
+        CW["Channel Workers"]
+        ROUTE["Provider Router<br/>health · cost · rate"]
+        SEP["Status Processor<br/>monotonic guard"]
+    end
+    subgraph sched ["app-scheduler · fixed 3 · on-demand nodes"]
+        direction LR
+        HYD["Due Hydrator<br/>leader-elected"]
+        CLAIM["Shard-affine Claimers"]
+        OUT["Outbox Sweeper"]
+    end
+    PG[("PostgreSQL<br/><b>system of record</b>")]
+    RD[("Valkey<br/>cache + coordination")]
+    S3[("S3<br/>bodies + manifests")]
+    PROV["Mock Providers<br/>SMS · Email · Push"]
+    SVC & CAMP --> ALB --> ACCEPT
+    ALB --> WH
+    ALB --> QRY
+    ACCEPT -->|"accept tx + outbox"| PG
+    ACCEPT <--> RD
+    ACCEPT -.->|"fast path"| TREQ
+    OUT -->|"safety net"| PG
+    OUT -.-> TREQ
+    TREQ -.-> ORCH --> CW --> ROUTE --> PROV
+    ORCH <--> RD
+    ORCH -.-> TTX & TBULK
+    TTX & TBULK -.-> CW
+    CW -.-> TRETRY -.-> HYD
+    CW --> PG
+    CW -.-> TSTAT & TDLQ
+    TSTAT -.-> SEP --> PG
+    PROV -.->|"delivery receipt"| WH
+    WH -.-> TSTAT
+    HYD --> PG
+    HYD --> RD --> CLAIM -.-> TTX
+    QRY --> PG
+    style api fill:#dbeafe,stroke:#3b82f6
+    style kafka fill:#fef3c7,stroke:#f59e0b
+    style worker fill:#ede9fe,stroke:#8b5cf6
+    style sched fill:#dcfce7,stroke:#22c55e
+    style PG fill:#bbf7d0,stroke:#16a34a
+    style TTX fill:#bbf7d0,stroke:#16a34a
+    style TBULK fill:#fed7aa,stroke:#f97316
+    style TDLQ fill:#fecaca,stroke:#ef4444

@@ -1,0 +1,59 @@
+flowchart TB
+    subgraph ask ["1 · ASK"]
+        direction TB
+        client[/"Send order-shipped<br/>to Priya"/]
+        seen{"Seen this exact<br/>request before?"}
+        replay(["Return the original answer.<br/>Send nothing."])
+    end
+    subgraph promise ["2 · PROMISE — we never lose it"]
+        direction TB
+        onetx["Write the notification AND a<br/>to-send note in ONE transaction"]
+        accepted(["202 Accepted<br/>with a tracking id"])
+        sweeper["A sweeper picks up anything<br/>the fast path missed"]
+    end
+    subgraph decide ["3 · DECIDE — should we send?"]
+        direction TB
+        prefs{"Opted out, quiet hours,<br/>or 5 already today?"}
+        suppress["SUPPRESSED with a reason.<br/>Never a silent drop."]
+        render["Render the template<br/>in their language"]
+    end
+    subgraph send ["4 · SEND — pick a provider"]
+        direction TB
+        pick["Score on health, cost<br/>and spare rate limit"]
+        record["Write the attempt<br/><b>BEFORE</b> calling out"]
+        callout["Call the provider"]
+        outcome{"What happened?"}
+        retry["Random backoff, then retry<br/>or switch provider"]
+        unknown["UNKNOWN. It may have<br/>arrived. Do not resend."]
+        dlq["Dead letter queue.<br/>A human can replay."]
+    end
+    subgraph confirm ["5 · CONFIRM — did it arrive?"]
+        direction TB
+        webhook[/"Provider calls back,<br/>minutes later"/]
+        verify["Check signature,<br/>drop duplicates"]
+        forward["Status only moves<br/>forwards, never back"]
+        done(["DELIVERED"])
+    end
+    client --> seen
+    seen -->|Yes| replay
+    seen -->|No| onetx --> accepted
+    onetx --> sweeper --> prefs
+    prefs -->|Blocked| suppress
+    prefs -->|Allowed| render --> pick --> record --> callout --> outcome
+    outcome -->|Accepted| webhook
+    outcome -->|"Temporary failure"| retry
+    outcome -->|"Timed out"| unknown
+    outcome -->|"Bad number"| dlq
+    retry -.->|"5 tiers, ~1 hour"| pick
+    unknown -.-> webhook
+    webhook --> verify --> forward --> done
+    style ask fill:#dbeafe,stroke:#3b82f6
+    style promise fill:#dcfce7,stroke:#22c55e
+    style decide fill:#fef3c7,stroke:#f59e0b
+    style send fill:#ede9fe,stroke:#8b5cf6
+    style confirm fill:#cffafe,stroke:#06b6d4
+    style accepted fill:#bbf7d0,stroke:#16a34a
+    style done fill:#bbf7d0,stroke:#16a34a
+    style dlq fill:#fecaca,stroke:#ef4444
+    style unknown fill:#fed7aa,stroke:#f97316
+    style suppress fill:#e5e7eb,stroke:#9ca3af

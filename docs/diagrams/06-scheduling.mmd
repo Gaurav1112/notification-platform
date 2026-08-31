@@ -1,0 +1,32 @@
+flowchart TB
+    req[/"Schedule for<br/>a future time"/] --> jitter["Deterministic jitter<br/>hash(id) mod 300s<br/><b>20,833/s → 4,167/s</b>"]
+    jitter --> persist["PostgreSQL<br/>partitioned on an<br/><b>immutable</b> due bucket"] --> accepted(["202 Accepted"])
+    subgraph tier2 ["Tier 2 · ONE elected writer"]
+        direction TB
+        leader{"Am I the leader?"}
+        standby["Stand by.<br/>Re-check the lock."]
+        scan["Range-scan the hot partition.<br/>Generates no dead tuples."]
+        push["Push next 5 minutes<br/>into Valkey ZSET"]
+    end
+    subgraph tier3 ["Tier 3 · many claimers · disjoint shards"]
+        direction TB
+        zpop["Read due items from<br/><b>my shards only</b>"]
+        claim["Claim with a<br/>60-second lease"]
+        size{"> 1000 recipients?"}
+        fanout["Expand in chunks<br/>from S3 manifest"]
+        publish["Publish to dispatch topic"]
+    end
+    persist --> leader
+    leader -->|No| standby
+    leader -->|Yes| scan --> push --> zpop --> claim --> size
+    size -->|No| publish
+    size -->|Yes| fanout --> publish
+    reaper["Lease reaper · every 30s"] --> expired{"Lease expired?"}
+    expired -->|Yes| reclaim["Back to READY<br/>claim_count++"] --> poison{"Claimed > 5 times?"}
+    poison -->|No| zpop
+    poison -->|Yes| dlq["Poison pill → DLQ"]
+    style tier2 fill:#dcfce7,stroke:#22c55e
+    style tier3 fill:#dbeafe,stroke:#3b82f6
+    style jitter fill:#fef3c7,stroke:#f59e0b
+    style dlq fill:#fecaca,stroke:#ef4444
+    style accepted fill:#bbf7d0,stroke:#16a34a

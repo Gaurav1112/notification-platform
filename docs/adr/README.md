@@ -7,7 +7,7 @@ chosen.
 decision record that only lists benefits is a sales page. The interesting question about any of these
 is not "why is it good" but "what did it cost, and when would you reverse it".
 
-Source: [§20 of the design spec](../superpowers/specs/2026-08-31-notification-platform-design.md#20-architecture-decision-records).
+Source: [§20 of the design spec](../design/DESIGN-SPEC.md#20-architecture-decision-records).
 
 ---
 

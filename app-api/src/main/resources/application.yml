@@ -16,11 +16,17 @@ spring:
   application:
     name: notification-api
 
-  # Running `./mvnw spring-boot:run` with no arguments must produce a working
-  # local app. Anything requiring a remembered -Dspring.profiles.active flag is
-  # a setup step half the reviewers will skip.
-  profiles:
-    default: local
+  # NO `profiles.default: local` here, deliberately.
+  #
+  # It was here, and it was a security hole: the `local` document below sets
+  # `permit-all: true` and enables the chaos endpoint, so a jar launched with no
+  # SPRING_PROFILES_ACTIVE would come up unauthenticated with a live "break any
+  # provider" admin endpoint. The default profile must be the safe one.
+  #
+  # Local developer experience is preserved without the trap: `spring-boot-maven-plugin`
+  # in this module's pom.xml sets the `local` profile for `./mvnw spring-boot:run`,
+  # so the dev command still needs no flags while the packaged artefact does not
+  # inherit it. Convenience belongs in the build tool, not in the runtime default.
 
   datasource:
     url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:notification}
@@ -367,8 +373,11 @@ notification:
     #   POST /admin/v1/mock-providers/mock-sms-primary/chaos
     #        {"mode":"HARD_DOWN","durationSeconds":120}
     # See `make demo`.
+    # Disabled in the base document. The chaos endpoint can take any provider
+    # offline for every tenant, so it must never be reachable by default —
+    # it is switched on only in the `local` profile document below.
     mock-chaos:
-      enabled: true
+      enabled: false
       admin-path: /admin/v1/mock-providers
 
   # ---------------------------------------------------------------------------
@@ -433,6 +442,15 @@ spring:
     properties:
       hibernate:
         format_sql: true
+
+  flyway:
+    # db/local carries V900__local_development_tenant.sql and is on the path ONLY
+    # here. The fixed development tenant that permit-all attributes every request
+    # to has to exist as a row, because every write scopes on notif.tenant.id --
+    # without it the first curl answers 401 and looks like a bug in the API. It is
+    # customer data, so it does not belong in the baseline migration, and it must
+    # never be applied anywhere this profile is not active.
+    locations: classpath:db/migration,classpath:db/local
 
   # Kept as a belt-and-braces fallback. With SecurityConfig.permitAllFilterChain
   # active (see notification.api.security.permit-all below) these credentials are

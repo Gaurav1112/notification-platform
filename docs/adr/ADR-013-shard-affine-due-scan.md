@@ -1,5 +1,8 @@
 # ADR-013: Shard-affine due-scan with `SKIP LOCKED`, and a leader-elected hydrator
 
+> **Status caveat (verified 2026-08-31).** The table this ADR governs, `notif.scheduled_notification`, is **not yet in a migration**, so the SQL described here has never executed in this repository. The 159 / 453 / 746 tps figures were measured on a design-time prototype, not on this code. Tracked in [STATUS.md](../STATUS.md).
+
+
 **Status:** Accepted
 **Date:** 2026-08-31
 

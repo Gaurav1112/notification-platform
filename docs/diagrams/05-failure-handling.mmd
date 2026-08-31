@@ -1,0 +1,34 @@
+flowchart TB
+    fail(["Provider call failed"]) --> classify["Classify into a FailureType"] --> kind{"Which kind?"}
+    kind -->|"Invalid number<br/>Unsubscribed"| permanent["FAILED<br/>Suppress address forever"]
+    kind -->|"Auth / quota"| authfail["No retry here.<br/>Failover + page on-call"]
+    kind -->|"Timed out"| unknown["UNKNOWN<br/>May have arrived.<br/><b>Do NOT resend.</b>"]
+    kind -->|"Transient / 5xx / 429"| budget{"Attempts left AND<br/>retry budget available?"}
+    budget -->|No| dlq["Dead letter queue"] --> triage["Operator triage + replay"]
+    budget -->|Yes| jitter["<b>Full jitter</b><br/>random(0, backoff)"]
+    jitter --> tiers["Tiered delay topics<br/>5s · 30s · 2m · 10m · 1h"]
+    tiers --> promoter["Promoter pauses the partition.<br/>Never Thread.sleep()."]
+    promoter --> eligible{"Still eligible?"} -->|No| expired["EXPIRED / CANCELLED"]
+    eligible -->|Yes| select["Score providers:<br/>health · latency · cost · rate budget"]
+    authfail --> select
+    select --> circuit{"Circuit state?"}
+    circuit -->|OPEN| nextprov["Skip. Next provider."] --> select
+    circuit -->|"CLOSED / HALF_OPEN"| callit["Send through decorator stack"]
+    callit --> res{"Result?"}
+    res -->|2xx| ok["Success.<br/>Close the circuit."]
+    res -->|"4xx"| ourbug["Does NOT trip the breaker.<br/>Our payload, our bug."]
+    res -->|"5xx / timeout"| count["failures++"] --> thresh{">50% of 20 calls<br/>in 60s?"}
+    thresh -->|No| callit
+    thresh -->|Yes| open["Circuit OPEN<br/>shared via Valkey"]
+    open --> halfopen["Wait 30s <b>jittered per pod</b><br/>then probe"]
+    halfopen -.->|"probe ok"| ok
+    halfopen -.->|"probe fails"| open
+    unknown -.->|"reconcile via webhook"| ok
+    style jitter fill:#fef3c7,stroke:#f59e0b
+    style open fill:#fecaca,stroke:#ef4444
+    style dlq fill:#fecaca,stroke:#ef4444
+    style permanent fill:#fecaca,stroke:#ef4444
+    style unknown fill:#fed7aa,stroke:#f97316
+    style ourbug fill:#fed7aa,stroke:#f97316
+    style ok fill:#bbf7d0,stroke:#16a34a
+    style halfopen fill:#fef3c7,stroke:#f59e0b

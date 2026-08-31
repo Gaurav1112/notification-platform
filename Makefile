@@ -22,6 +22,20 @@ DB_NAME   := notification
 # One place to change the demo payload shape if the API contract moves.
 SMS_BODY  = {"trafficClass":"CRITICAL","channels":["SMS"],"recipients":{"kind":"INLINE","addresses":["+15550100001"]},"content":{"body":"Your verification code is 481920"},"schedule":{"type":"IMMEDIATE"},"ttlSeconds":60,"metadata":{"correlationId":"demo-chaos"}}
 
+
+# Testcontainers 2.x probes /var/run/docker.sock, which does not exist on Rancher
+# Desktop or Colima. Without this, `make test-it` fails with "Could not find a valid
+# Docker environment" even though Docker is running perfectly. DOCKER_HOST detection:
+DOCKER_SOCK := $(shell \
+  if [ -S /var/run/docker.sock ]; then echo ""; \
+  elif [ -S "$$HOME/.rd/docker.sock" ]; then echo "unix://$$HOME/.rd/docker.sock"; \
+  elif [ -S "$$HOME/.colima/default/docker.sock" ]; then echo "unix://$$HOME/.colima/default/docker.sock"; \
+  else echo ""; fi)
+ifneq ($(DOCKER_SOCK),)
+export DOCKER_HOST := $(DOCKER_SOCK)
+export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE := /var/run/docker.sock
+endif
+
 .PHONY: help up down logs ps topics build test test-it psql reset wait status demo
 
 # -----------------------------------------------------------------------------

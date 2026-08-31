@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The Docker-less leg. A clean clone must build green on any machine with only
+  # a JDK, which is why Testcontainers tests are @Tag("integration") and excluded
+  # by default. This job proves that property has not rotted.
+  #
+  # The 17/21 matrix is not decoration. `spring.threads.virtual.enabled: true` is
+  # a silent no-op on 17 — no error, no warning — so a single-version build lets
+  # a config lie sit undetected. Running both makes the difference observable.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build (java ${{ matrix.java }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ['17', '21']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+
+      - name: Build and test (no Docker required)
+        run: ./mvnw -B -ntp verify
+
+      - name: Upload surefire reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-java-${{ matrix.java }}
+          path: '**/target/surefire-reports/**'
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # The Testcontainers leg. Kept separate deliberately: the split is a design
+  # decision about who can build this repo, and the workflow should make it
+  # visible rather than hide it behind one opaque command.
+  # ---------------------------------------------------------------------------
+  integration:
+    name: integration (Testcontainers)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Build and test (with Docker)
+        run: ./mvnw -B -ntp verify -Pintegration
+        env:
+          TESTCONTAINERS_REUSE_ENABLE: 'true'
+
+      - name: Upload surefire reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-integration
+          path: '**/target/surefire-reports/**'
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Proves the schema applies to a real PostgreSQL 18.6 from a clean database,
+  # which is the one claim every other database claim rests on.
+  # ---------------------------------------------------------------------------
+  schema:
+    name: schema applies clean
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.6
+        env:
+          POSTGRES_PASSWORD: pw
+          POSTGRES_DB: notification
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply V1 with ON_ERROR_STOP
+        run: |
+          PGPASSWORD=pw psql -h localhost -U postgres -d notification \
+            -v ON_ERROR_STOP=1 -q \
+            -f platform-persistence/src/main/resources/db/migration/V1__baseline.sql
+          echo "migration applied cleanly"
+
+      - name: Assert the objects the docs claim
+        run: |
+          PGPASSWORD=pw psql -h localhost -U postgres -d notification -t -A -F',' -c "
+            SELECT
+              (SELECT count(*) FROM information_schema.tables
+                 WHERE table_schema='notif' AND table_type='BASE TABLE'),
+              (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                 WHERE n.nspname='notif' AND c.relkind='p'),
+              (SELECT count(*) FROM pg_indexes WHERE schemaname='notif');" | tee counts.csv
+          # Fail loudly if the schema shrinks unexpectedly — the docs quote these numbers.
+          awk -F, '{ if ($1 < 100 || $2 != 6 || $3 < 200) { print "schema counts moved: " $0; exit 1 } }' counts.csv
+
+  # ---------------------------------------------------------------------------
+  # Supply chain. Deliberately NOT using dependency-check-maven as a blocking
+  # gate: its NVD feed rate-limits without an API key, so it goes red for reasons
+  # unrelated to the code — which trains people to ignore a red build.
+  # ---------------------------------------------------------------------------
+  supply-chain:
+    name: SBOM and dependency review
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Generate CycloneDX SBOM
+        run: ./mvnw -B -ntp org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom -DskipTests
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: target/*.json
+          retention-days: 30
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: '0'          # report, do not block — see the comment above
+          format: table

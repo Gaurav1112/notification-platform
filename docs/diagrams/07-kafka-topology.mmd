@@ -1,0 +1,36 @@
+flowchart LR
+    api["app-api"] --> req["notification.requested<br/>12 partitions"] --> orch["Orchestrator"]
+    subgraph txlane ["TX LANE — OTPs and receipts. Almost always empty."]
+        direction TB
+        smstx["dispatch.sms.tx<br/>12p · minISR 3"]
+        emailtx["dispatch.email.tx<br/>12p"]
+        pushtx["dispatch.push.tx<br/>18p"]
+    end
+    subgraph bulklane ["BULK LANE — campaigns. Can be 9 million deep."]
+        direction TB
+        smsbulk["dispatch.sms.bulk<br/>6p"]
+        emailbulk["dispatch.email.bulk<br/>36p"]
+        pushbulk["dispatch.push.bulk<br/>54p"]
+    end
+    subgraph retry ["RETRY TIERS — pause the partition, never sleep"]
+        direction TB
+        r5["retry.5s · 24p<br/><i>sized for a TOTAL outage</i>"]
+        r30["retry.30s · 12p"]
+        rest["retry.2m / 10m / 1h · 6p each"]
+    end
+    workers["Channel Workers"]
+    status["notification.status<br/>48p · compacted"]
+    dlq["notification.dlq<br/>6p · 30-day retention"]
+    orch --> smstx & emailtx & pushtx
+    orch --> smsbulk & emailbulk & pushbulk
+    smstx & emailtx & pushtx --> workers
+    smsbulk & emailbulk & pushbulk --> workers
+    workers -->|"transient failure"| r5
+    r5 -.-> r30 -.-> rest
+    r5 & r30 & rest -->|"promote when due"| smstx
+    workers -->|"exhausted / poison"| dlq
+    workers --> status
+    style txlane fill:#dcfce7,stroke:#22c55e
+    style bulklane fill:#fed7aa,stroke:#f97316
+    style retry fill:#fef3c7,stroke:#f59e0b
+    style dlq fill:#fecaca,stroke:#ef4444

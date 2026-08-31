@@ -21,8 +21,6 @@ spring:
   application:
     name: notification-worker
 
-  profiles:
-    default: local
 
   datasource:
     url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:notification}
@@ -110,7 +108,12 @@ spring:
       # 100, not the default 500. Each record can cost a ~250 ms provider round
       # trip; 500 of those is 125 s of work between polls against a 300 s
       # interval, which leaves no margin for a single slow provider.
-      max-poll-records: 100
+      # INVARIANT: max-poll-records x provider timeout must stay below
+      # max.poll.interval.ms, or a degraded provider evicts the consumer.
+      #   30 x 8s = 240s  <  300s   OK
+      #  100 x 8s = 800s  >  300s   rebalance storm
+      # Asserted in ConsumerBudgetInvariantTest.
+      max-poll-records: 30
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
       properties:
@@ -367,8 +370,10 @@ notification:
     #   POST /admin/v1/mock-providers/mock-sms-primary/chaos
     #        {"mode":"HARD_DOWN","durationSeconds":120}
     # See `make demo`.
+    # Disabled in the base document; the chaos endpoint can take any provider
+    # offline for every tenant. Enabled only in the `local` profile.
     mock-chaos:
-      enabled: true
+      enabled: false
       admin-path: /admin/v1/mock-providers
 
 logging:

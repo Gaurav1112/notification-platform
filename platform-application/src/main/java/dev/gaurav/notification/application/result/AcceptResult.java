@@ -62,7 +62,22 @@ public record AcceptResult(
     }
 
     /** True when the caller must write {@link Replay#body()} rather than serialise this record. */
-    public boolean isReplay() {
+    /**
+     * Named {@code hasReplay}, not {@code isReplay}, and that is load-bearing.
+     *
+     * <p>Jackson maps a no-arg {@code isXxx()} to a boolean property named {@code xxx}. With this
+     * method called {@code isReplay()} it collided with the {@code replay} record component: the
+     * serialiser wrote {@code "replay": false} instead of the {@link Replay} object, and reading
+     * the stored idempotency response back then failed with
+     * {@code MismatchedInputException: cannot construct Replay from boolean value (false)}.
+     *
+     * <p>The effect was that every idempotent <em>replay</em> — the entire point of the
+     * {@code Idempotency-Key} header — returned a 500. Unit tests did not catch it because they
+     * assert on the object, never on a serialise/deserialise round trip; only an end-to-end POST
+     * of the same key twice surfaced it. {@code AcceptResultSerializationTest} is the regression
+     * oracle.
+     */
+    public boolean hasReplay() {
         return replay != null;
     }
 

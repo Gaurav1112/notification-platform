@@ -78,9 +78,8 @@ Full diagram set: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 | [RUNBOOK.md](docs/RUNBOOK.md) | On-call procedures, DR failover, DLQ replay |
 | [LOAD-TEST.md](docs/LOAD-TEST.md) | Harness, scenarios, and an **empty** results table — no invented numbers |
 | [ADDING-A-PROVIDER.md](docs/ADDING-A-PROVIDER.md) | One class plus two config rows, against the real SPI |
-| [INTERVIEW-GUIDE.md](docs/INTERVIEW-GUIDE.md) | How to explain all of it out loud, including a six-file code tour |
 | [adr/](docs/adr/) | 18 architecture decision records, each with the negative consequences |
-| [Design spec](docs/superpowers/specs/2026-08-31-notification-platform-design.md) | The full source document |
+| [Design spec](docs/design/DESIGN-SPEC.md) | The full source document |
 
 ## Quick start
 
@@ -141,12 +140,22 @@ make build                                # ./mvnw -q -B -DskipTests install
 ./mvnw -pl app-scheduler spring-boot:run
 ```
 
-> **⚠ `app-api` does not start today.** `NotificationCommandPort`, `NotificationQueryPort` and
-> `WebhookIngestPort` have no implementations, so the context fails with
-> `UnsatisfiedDependencyException`. Its 29 tests are MockMvc slices against mocked ports and they
-> pass; the controllers, RFC 9457 error handling, interceptors and webhook verifier are all real.
-> What is missing is the adapter layer to `platform-application`.
-> `app-worker` and `app-scheduler` are internally consistent and do start.
+> **⚠ None of the three applications starts today.** Verified by running them, not inferred.
+>
+> `platform-application` declares four `@Service` use cases whose outbound ports —
+> `QuotaGuard`, `ResponseSerializer`, `EventPublisher`, `NotificationQuery`,
+> `DispatchTombstoneStore` — have **no production beans**; implementations exist only as test
+> fakes. All three apps depend on that module and component-scan `dev.gaurav.notification`, so
+> all three fail with `UnsatisfiedDependencyException`. `app-api` additionally lacks adapters for
+> its own three inbound ports.
+>
+> Nothing in the test suite catches this: there is **not one `@SpringBootTest` in any app
+> module**, so 371 green tests coexist with three applications that cannot boot. A three-line
+> `contextLoads()` per app would have caught it, and that is the first fix on the list.
+>
+> The code beneath is real — controllers, RFC 9457 error handling, interceptors, the webhook
+> verifier, the channel workers, the retry chain and the monotonic guard all exist and are
+> tested. What is missing is the wiring between the layers.
 >
 > Consequently the `make demo`, `make status` and `make wait` targets — and the `curl` examples
 > below — describe the intended surface rather than something that runs today.
@@ -254,7 +263,7 @@ Java 17 · Spring Boot 4.1.1 · Kafka 4.3.1 (KRaft) · PostgreSQL 18.6 · Valkey
 Flyway 12 · Testcontainers 2 · JUnit 6 + AssertJ · Micrometer · Prometheus + Grafana
 
 Every version verified live against Maven Central and Docker Hub — see
-[§19 of the spec](docs/superpowers/specs/2026-08-31-notification-platform-design.md#19-technology-versions)
+[§19 of the spec](docs/design/DESIGN-SPEC.md#19-technology-versions)
 for the pins that must **not** be the newest available, and why.
 
 Spring Boot 4 traps worth knowing: Jackson's groupId is `tools.jackson`; JUnit is 6; Testcontainers

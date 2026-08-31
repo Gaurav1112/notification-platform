@@ -1,0 +1,36 @@
+stateDiagram-v2
+    direction LR
+    [*] --> Pending
+    Pending --> Suppressed: preference / dedup
+    Pending --> Queued: eligible
+    Queued --> Processing: worker claimed
+    Queued --> Cancelled: cancel API
+    Queued --> Expired: TTL elapsed
+    Processing --> Sent: provider ACK
+    Processing --> Retrying: retryable failure
+    Processing --> Failed: permanent failure
+    Processing --> Unknown: timeout after send
+    Retrying --> Queued: backoff elapsed
+    Retrying --> Failed: attempts exhausted
+    Unknown --> Delivered: late webhook
+    Unknown --> Failed: reconciled as lost
+    Sent --> Delivered: delivery receipt
+    Sent --> Bounced: hard bounce
+    Delivered --> Bounced: hard bounce after SMTP 250
+    Delivered --> [*]
+    Failed --> [*]
+    Bounced --> [*]
+    Suppressed --> [*]
+    Expired --> [*]
+    Cancelled --> [*]
+    note right of Unknown
+        The state most designs omit.
+        Provider timed out AFTER
+        possibly delivering.
+        Never blind-retry from here.
+    end note
+    note right of Delivered
+        Deliberately NOT terminal —
+        a hard bounce legitimately
+        follows an SMTP 250.
+    end note

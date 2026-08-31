@@ -1,0 +1,39 @@
+flowchart TB
+    users["Clients"] --> r53["Route 53<br/>health-checked failover"] --> alb["ALB + WAF"]
+    subgraph primary ["PRIMARY REGION"]
+        direction LR
+        subgraph az1 ["AZ-1"]
+            api1["api pods<br/>HPA 3→60"]
+            w1["worker pods<br/>70% spot"]
+            k1["MSK broker"]
+            pg1["RDS primary"]
+        end
+        subgraph az2 ["AZ-2"]
+            api2["api pods"]
+            w2["worker pods"]
+            k2["MSK broker"]
+            pg2["RDS standby<br/>synchronous"]
+        end
+        subgraph az3 ["AZ-3"]
+            api3["api pods"]
+            w3["worker pods"]
+            sch["scheduler pods<br/><b>on-demand only</b>"]
+            k3["MSK broker"]
+        end
+    end
+    subgraph dr ["DR REGION — warm standby"]
+        direction LR
+        pgdr["RDS read replica"]
+        kdr["MSK Replicator target"]
+        eksdr["EKS scaled to zero<br/>Terraform"]
+    end
+    alb --> api1 & api2 & api3
+    pg1 -->|synchronous| pg2
+    pg1 -.->|"async · RPO ~1s"| pgdr
+    k1 -.->|"offset translation"| kdr
+    r53 -.->|"RTO 30 min · RPO < 5 min"| dr
+    style primary fill:#dbeafe,stroke:#3b82f6
+    style dr fill:#e5e7eb,stroke:#9ca3af
+    style pg1 fill:#bbf7d0,stroke:#16a34a
+    style sch fill:#fef3c7,stroke:#f59e0b
+    style w1 fill:#fed7aa,stroke:#f97316

@@ -1,0 +1,31 @@
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant API as app-api
+    participant R as Valkey
+    participant PG as PostgreSQL
+    participant K as Kafka
+    participant W as Worker
+    participant P as Provider
+
+    C->>API: POST /v1/notifications<br/>Idempotency-Key: order-4821
+    API->>R: check idempotency key
+    R-->>API: miss
+    rect rgb(220, 252, 231)
+    Note over API,PG: ONE transaction — the atomic accept
+    API->>PG: INSERT notification_request
+    API->>PG: INSERT notification
+    API->>PG: INSERT outbox_message
+    PG-->>API: COMMIT
+    end
+    API-->>C: 202 Accepted + notificationId
+    API-)K: produce notification.requested
+    K->>W: consume
+    W->>R: preferences, quiet hours, frequency cap
+    W->>PG: INSERT delivery_attempt (PENDING)
+    Note over W,PG: committed BEFORE the network call
+    W->>P: send(payload, idempotencyToken)
+    P-->>W: 202 providerMessageId
+    W->>PG: attempt SUCCEEDED · status SENT
+    P--)API: webhook delivery receipt (40s later)
+    API->>PG: monotonic transition → DELIVERED

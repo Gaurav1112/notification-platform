@@ -34,7 +34,10 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
-                <configuration><mainClass>dev.gaurav.notification.api.NotificationApiApplication</mainClass></configuration>
+                <configuration>
+                    <!-- `local` for ./mvnw spring-boot:run only. Deliberately NOT
+                         spring.profiles.default, so the packaged jar starts secure. -->
+                    <profiles><profile>local</profile></profiles><mainClass>dev.gaurav.notification.api.NotificationApiApplication</mainClass></configuration>
             </plugin>
         </plugins>
     </build>

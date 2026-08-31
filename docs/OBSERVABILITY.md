@@ -2,7 +2,7 @@
 
 SLIs, the metric catalogue, burn-rate alerting, and the dashboards.
 
-Source: [§12 of the design spec](superpowers/specs/2026-08-31-notification-platform-design.md#12-observability).
+Source: [§12 of the design spec](design/DESIGN-SPEC.md#12-observability).
 The rules described here are **real files in this repository**:
 
 | File | Contents |

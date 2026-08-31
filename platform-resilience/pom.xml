@@ -12,6 +12,9 @@
     <name>Platform :: Resilience</name>
     <dependencies>
         <dependency><groupId>dev.gaurav.notification</groupId><artifactId>platform-domain</artifactId></dependency>
+        <!-- The Valkey-backed adapters in dev.gaurav.notification.adapter.cache implement the
+             application's QuotaGuard and DispatchTombstoneStore ports. -->
+        <dependency><groupId>dev.gaurav.notification</groupId><artifactId>platform-application</artifactId></dependency>
         <dependency><groupId>io.github.resilience4j</groupId><artifactId>resilience4j-spring-boot4</artifactId></dependency>
         <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-redis</artifactId></dependency>
         <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency>

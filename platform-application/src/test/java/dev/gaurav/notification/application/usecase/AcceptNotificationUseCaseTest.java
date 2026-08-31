@@ -64,8 +64,8 @@ class AcceptNotificationUseCaseTest {
         var first = useCase.accept(TestCommands.send("order-4821", "{\"orderId\":\"A-4821\"}"));
         var second = useCase.accept(TestCommands.send("order-4821", "{\"orderId\":\"A-4821\"}"));
 
-        assertThat(first.isReplay()).isFalse();
-        assertThat(second.isReplay()).isTrue();
+        assertThat(first.hasReplay()).isFalse();
+        assertThat(second.hasReplay()).isTrue();
         // The bytes the first caller got, handed back verbatim — including the original ids.
         assertThat(second.replayed().orElseThrow().body())
                 .isEqualTo(new FakeResponseSerializer().serialize(first));
@@ -112,7 +112,7 @@ class AcceptNotificationUseCaseTest {
 
         var result = useCase.accept(TestCommands.send("order-4821", "body"));
 
-        assertThat(result.isReplay()).isFalse();
+        assertThat(result.hasReplay()).isFalse();
         assertThat(writer.persistCount()).isEqualTo(1);
         assertThat(quota.calls()).isEqualTo(1);
     }

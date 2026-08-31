@@ -2,7 +2,7 @@
 
 Every dependency that can fail, what the platform does when it does, and how it recovers.
 
-Source: [§9 of the design spec](superpowers/specs/2026-08-31-notification-platform-design.md#9-failure-model).
+Source: [§9 of the design spec](design/DESIGN-SPEC.md#9-failure-model).
 Where the behaviour described here is **designed but not built**, it says so inline. Operational
 procedures live in [RUNBOOK.md](RUNBOOK.md); this page is the model behind them.
 

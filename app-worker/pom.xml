@@ -18,6 +18,14 @@
         <dependency><groupId>dev.gaurav.notification</groupId><artifactId>platform-provider</artifactId></dependency>
         <dependency><groupId>dev.gaurav.notification</groupId><artifactId>platform-resilience</artifactId></dependency>
         <dependency><groupId>dev.gaurav.notification</groupId><artifactId>platform-observability</artifactId></dependency>
+        <!-- Actuator does not bring a servlet container. Without this there is no
+             /actuator/health, no /actuator/prometheus, no k8s probe endpoint, and the
+             Prometheus scrape target can never come up. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
         <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-actuator</artifactId></dependency>
         <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency>
     </dependencies>
@@ -26,7 +34,10 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
-                <configuration><mainClass>dev.gaurav.notification.worker.NotificationWorkerApplication</mainClass></configuration>
+                <configuration>
+                    <!-- `local` for ./mvnw spring-boot:run only. Deliberately NOT
+                         spring.profiles.default, so the packaged jar starts secure. -->
+                    <profiles><profile>local</profile></profiles><mainClass>dev.gaurav.notification.worker.NotificationWorkerApplication</mainClass></configuration>
             </plugin>
         </plugins>
     </build>

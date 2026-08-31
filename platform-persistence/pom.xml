@@ -13,8 +13,26 @@
     <dependencies>
         <dependency><groupId>dev.gaurav.notification</groupId><artifactId>platform-domain</artifactId></dependency>
         <dependency><groupId>dev.gaurav.notification</groupId><artifactId>platform-application</artifactId></dependency>
+        <!--
+          The outbox table stores a Kafka topic, a partition key and a serialised event, so the wire
+          contract is already a persistence concern here. The accept transaction writes that event
+          in the same statement batch as the notification rows (see JpaAcceptanceWriter), which is
+          the whole point of an outbox: "accepted" and "will be published" become one fact. Building
+          the payload from a hand-rolled map instead would be a second, drifting copy of a format
+          platform-messaging already owns.
+        -->
+        <dependency><groupId>dev.gaurav.notification</groupId><artifactId>platform-messaging</artifactId></dependency>
         <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-jpa</artifactId></dependency>
         <dependency><groupId>org.flywaydb</groupId><artifactId>flyway-core</artifactId></dependency>
+        <!--
+          Boot 4 split its auto-configurations into per-technology modules, so flyway-core alone
+          puts the API on the classpath and nothing that reads spring.flyway.*. Without this the
+          properties in every application.yml are inert: no migration runs at startup, the schema
+          only exists because somebody applied it by hand, and `enabled: false` in app-worker and
+          app-scheduler is documentation rather than a switch. Declaring it here makes the
+          single-writer rule those files describe actually true.
+        -->
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-flyway</artifactId></dependency>
         <dependency><groupId>org.flywaydb</groupId><artifactId>flyway-database-postgresql</artifactId></dependency>
         <dependency><groupId>org.postgresql</groupId><artifactId>postgresql</artifactId><scope>runtime</scope></dependency>
         <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-testcontainers</artifactId><scope>test</scope></dependency>
