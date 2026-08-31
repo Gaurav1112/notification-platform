@@ -47,6 +47,11 @@
         <mapstruct.version>1.6.3</mapstruct.version>
         <archunit.version>1.4.1</archunit.version>
         <jsr305.version>3.0.2</jsr305.version>
+
+        <!-- Tests tagged @Tag("integration") need a reachable Docker daemon (Testcontainers).
+             They are skipped by default so a clean checkout builds on any machine; the
+             'integration' profile below clears this and runs the whole suite. -->
+        <excluded.test.groups>integration</excluded.test.groups>
     </properties>
 
     <dependencyManagement>
@@ -142,6 +147,7 @@
                     <configuration>
                         <!-- concurrency tests need real parallelism -->
                         <argLine>-Xmx1g</argLine>
+                        <excludedGroups>${excluded.test.groups}</excludedGroups>
                     </configuration>
                 </plugin>
                 <plugin>
@@ -177,4 +183,17 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!-- ./mvnw verify -Pintegration
+             Adds back the Testcontainers-backed tests. Kept out of the default build because a
+             missing Docker daemon fails them at class-initialisation time, which looks identical
+             to a real regression and trains people to ignore a red suite. -->
+        <profile>
+            <id>integration</id>
+            <properties>
+                <excluded.test.groups/>
+            </properties>
+        </profile>
+    </profiles>
 </project>

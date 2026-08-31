@@ -1,0 +1,391 @@
+# =============================================================================
+# app-scheduler — hydrator + shard-affine claimers.
+#
+# Delayed sends are NOT parked inside the broker. Every company that tried it
+# regretted it: DoorDash banned Celery countdowns after outages traced directly
+# to them, Airbnb replaced Resque Scheduler, Uber built hour-bucketed topics
+# rather than use any broker delay feature. Scheduled work lives in Postgres
+# with a due-scan; Kafka is transport, never a timer.
+#
+# Fixed at 3 on-demand replicas in production — never spot. A scheduler
+# eviction during a claim window converts into duplicated dispatch, which the
+# monotonic guard makes safe but not free.
+#
+# NOTE: app-scheduler's pom has spring-boot-starter-actuator but no servlet
+# container, so /actuator/prometheus is not currently served over HTTP and the
+# `notification-scheduler` Prometheus job will show as down. Adding
+# spring-boot-starter-web to app-scheduler/pom.xml fixes it; that file belongs
+# to another module and is not edited here.
+# =============================================================================
+
+spring:
+  application:
+    name: notification-scheduler
+
+  profiles:
+    default: local
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:notification}
+    username: ${DB_USER:notification}
+    password: ${DB_PASSWORD:notification}
+    hikari:
+      pool-name: np-scheduler-pool
+      # Deliberately small. The due-scan is the one query in the system that
+      # gets catastrophically worse with concurrency: a documented pgsql-general
+      # case hit a wall at 128 concurrent SKIP LOCKED claimers on 80 cores,
+      # because each session must skip every dead tuple left by all the others.
+      # Wasted index visits scale as B·W²/2 — raising the batch size to
+      # "improve efficiency" multiplies the quadratic term. Fewer claimers with
+      # bigger leases beats more claimers.
+      maximum-pool-size: ${DB_POOL_MAX:8}
+      minimum-idle: 2
+      connection-timeout: 3000
+      max-lifetime: 900000
+      leak-detection-threshold: 10000
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 100
+          time_zone: UTC
+        order_inserts: true
+        order_updates: true
+
+  flyway:
+    # Disabled: migration has one owner (app-api locally, a pre-deploy Job in
+    # production). See app-worker/src/main/resources/application.yml.
+    enabled: false
+    locations: classpath:db/migration
+    schemas: notif
+    default-schema: notif
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 200ms
+      connect-timeout: 200ms
+      lettuce:
+        # Unpooled — see app-api/src/main/resources/application.yml. Enabling
+        # the pool additionally requires org.apache.commons:commons-pool2,
+        # which is not on the classpath; Boot 4 fails the context rather than
+        # falling back.
+        pool:
+          enabled: false
+        shutdown-timeout: 200ms
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    producer:
+      acks: all
+      retries: 2147483647
+      batch-size: 262144
+      compression-type: zstd
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5
+        delivery.timeout.ms: 120000
+        linger.ms: 25
+    consumer:
+      group-id: ${KAFKA_GROUP:notification-scheduler}
+      client-id: notification-scheduler
+      enable-auto-commit: false
+      auto-offset-reset: earliest
+      isolation-level: read-committed
+      max-poll-records: 100
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        group.protocol: consumer
+        max.poll.interval.ms: 300000
+        spring.json.trusted.packages: dev.gaurav.notification.*
+    listener:
+      ack-mode: manual
+      observation-enabled: true
+
+  threads:
+    virtual:
+      enabled: true
+
+  lifecycle:
+    timeout-per-shutdown-phase: 45s
+
+server:
+  port: ${SERVER_PORT:8083}
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  health:
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+  metrics:
+    tags:
+      application: notification-scheduler
+    distribution:
+      percentiles-histogram:
+        scheduler.dispatch.lag: true
+      # 30 s is the SLO boundary the burn-rate rule counts against; the bucket
+      # must exist or sli:scheduler_lag:bad_ratio_30m has no series to read.
+      slo:
+        scheduler.dispatch.lag: 5s,10s,30s,60s,300s
+  tracing:
+    sampling:
+      probability: 1.0
+
+notification:
+  scheduler:
+    # --- hydrator ---------------------------------------------------------
+    hydrator:
+      # Leader-elected, single writer. SKIP LOCKED fixes correctness and
+      # serialisation; it does NOT fix bloat. Running the due-scan on every
+      # replica multiplies wasted index visits without moving a single row
+      # sooner (spec §22.4).
+      leader-election: true
+      lease-name: notification-hydrator
+      lease-duration: 30s
+      lease-renew-interval: 10s
+      # Horizon: how far ahead of `now` rows are pulled into the ready set.
+      # Wide enough that a hydrator restart is invisible, narrow enough that a
+      # cancellation still lands before dispatch.
+      horizon: 5m
+      scan-interval: 5s
+      batch-size: 1000
+
+    # --- claimers ---------------------------------------------------------
+    claimer:
+      # Shard-affine: each claimer owns a fixed hash range, so two claimers
+      # never contend for the same rows and SKIP LOCKED almost never has to
+      # skip anything. This is what keeps the B·W² term small.
+      shards: 8
+      lease-duration: 60s
+      batch-size: 200
+      max-claims-per-row: 5
+
+    # --- quiet hours ------------------------------------------------------
+    quiet-hours:
+      # 15 minutes, not hourly. UTC+05:45 (Nepal), UTC+05:30 (India) and
+      # UTC+08:45 (Eucla) are not on hour boundaries, so an hourly tick
+      # delivers into someone's quiet hours by up to 45 minutes.
+      tick: 15m
+      # Timezone-dependent values are computed in Java, never in Postgres.
+      # PostgreSQL resolves `AT TIME ZONE` against the tzdata bundled with the
+      # server, so a DST rule change silently produces different answers in the
+      # database and the application until the next minor upgrade.
+      resolve-timezone-in-application: true
+
+    # --- dispatch jitter --------------------------------------------------
+    dispatch:
+      # Campaign sends are jittered rather than fired on the mark. Two
+      # independent reasons: it flattens the thundering herd against our own
+      # workers, and FCM's documented guidance is to avoid sending within two
+      # minutes of the :00/:15/:30/:45 marks.
+      jitter: 90s
+      avoid-quarter-hour-marks: true
+      # Publishing a claimed row is a Kafka produce plus a status transition to
+      # DISPATCHED. If the produce fails the lease simply expires and another
+      # claimer retries — never a partial state.
+      publish-timeout: 10s
+
+  providers:
+    mock:
+      enabled: true
+
+      # Seeded RNG. Deterministic failure injection is what lets a CI job
+      # assert "exactly 3 messages reached the DLQ" instead of "some messages
+      # probably failed", which is not a test. Move this number and every
+      # failure in the suite changes.
+      seed: ${MOCK_SEED:20260831}
+
+      providers:
+
+        # --- SMS: Twilio semantics -------------------------------------------
+        # Twilio offers NO client-side idempotency key, which is what forces
+        # the UNKNOWN path to be real rather than theoretical. SILENT_SUCCESS
+        # carries a heavy weight here for the same reason: the mock ACKs after
+        # our timeout and fires the webhook anyway, and that is the only honest
+        # way to produce AttemptState.UNKNOWN.
+        # Failure codes emulated: 21610 STOP, 21614 not-a-mobile,
+        # 20429 too-many-requests, 30003 unreachable handset.
+        mock-sms-primary:
+          success-rate: 0.965
+          latency:
+            median: 250ms
+            p99: 2500ms
+          failures:
+            - { profile: TRANSIENT_NETWORK,   weight: 28 }
+            - { profile: PROVIDER_5XX,        weight: 18 }
+            - { profile: RATE_LIMITED,        weight: 20 }   # 20429
+            - { profile: INVALID_RECIPIENT,   weight: 12 }   # 21614
+            - { profile: UNSUBSCRIBED,        weight: 8 }    # 21610
+            - { profile: DEVICE_UNREGISTERED, weight: 4 }    # 30003
+            - { profile: SILENT_SUCCESS,      weight: 10 }
+
+        # The failover target. Deliberately healthier and slower: a secondary
+        # that is equally unreliable proves nothing about failover, and one
+        # that is equally fast hides the cost of failing over.
+        mock-sms-secondary:
+          success-rate: 0.985
+          latency:
+            median: 400ms
+            p99: 3500ms
+          failures:
+            - { profile: TRANSIENT_NETWORK, weight: 50 }
+            - { profile: PROVIDER_5XX,      weight: 30 }
+            - { profile: SILENT_SUCCESS,    weight: 20 }
+
+        # --- EMAIL: Amazon SES semantics --------------------------------------
+        # 50-destination bulk with per-destination results, `Throttling`,
+        # Permanent/General bounces and the complaint feedback loop. Bounces
+        # and complaints are ASYNCHRONOUS (SNS), not send-time results, so they
+        # arrive minutes later and must still reach the suppression list --
+        # otherwise sender reputation degrades and every tenant pays for it.
+        mock-email-primary:
+          success-rate: 0.99
+          latency:
+            median: 150ms
+            p99: 1200ms
+          failures:
+            - { profile: TRANSIENT_NETWORK, weight: 30 }
+            - { profile: RATE_LIMITED,      weight: 30 }   # Throttling
+            - { profile: CONTENT_REJECTED,  weight: 15 }   # MessageRejected
+            - { profile: INVALID_RECIPIENT, weight: 12 }
+            - { profile: UNSUBSCRIBED,      weight: 8 }
+            - { profile: QUOTA_EXCEEDED,    weight: 3 }    # AccountSendingPaused
+            - { profile: SILENT_SUCCESS,    weight: 2 }
+
+        mock-email-secondary:
+          success-rate: 0.995
+          latency:
+            median: 220ms
+            p99: 1800ms
+          failures:
+            - { profile: TRANSIENT_NETWORK, weight: 60 }
+            - { profile: RATE_LIMITED,      weight: 30 }
+            - { profile: SILENT_SUCCESS,    weight: 10 }
+
+        # --- PUSH: FCM v1 + APNs semantics ------------------------------------
+        # DEVICE_UNREGISTERED dominates on purpose: dead tokens are the normal
+        # steady state of a push channel, not an incident, and the 410 response
+        # carries the timestamp at which the token went invalid -- without it
+        # you cannot tell a genuinely dead token from one replaced after this
+        # message was queued.
+        #
+        # There is NO batch endpoint. FCM's /batch was deprecated 2023-06-21
+        # and stopped working 2024-06-21; sendEachForMulticast fans out to
+        # individual HTTP/2 requests and 500 is a client-side chunking limit,
+        # not a server batch. The mock reproduces one request per token so
+        # connection-pool sizing is exercised honestly.
+        mock-push-primary:
+          success-rate: 0.96
+          latency:
+            median: 200ms
+            p99: 1600ms
+          failures:
+            - { profile: DEVICE_UNREGISTERED, weight: 45 }  # UNREGISTERED / 404
+            - { profile: TRANSIENT_NETWORK,   weight: 20 }
+            - { profile: RATE_LIMITED,        weight: 15 }  # QUOTA_EXCEEDED / 429
+            - { profile: PROVIDER_5XX,        weight: 12 }  # UNAVAILABLE
+            - { profile: INVALID_RECIPIENT,   weight: 5 }   # INVALID_ARGUMENT
+            - { profile: SILENT_SUCCESS,      weight: 3 }
+
+    # -------------------------------------------------------------------------
+    # Mock webhook emitter.
+    #
+    # Not yet consumed by a @ConfigurationProperties class -- the emitter is
+    # still to be written -- but the numbers belong here rather than as
+    # constants, because each one exists to make a specific defence REAL
+    # instead of assumed:
+    #
+    #   out-of-order 5%  -> the monotonic guard in DeliveryStatus.transitionTo
+    #   duplicate    2%  -> the idempotent receiver
+    #   loss         1%  -> the reconciler; nothing else would ever find these
+    #   delay 2-45 s     -> DELIVERED arriving long after we moved on
+    #
+    # The emitter calls our OWN public endpoint with a correct HMAC, so
+    # signature verification is genuinely exercised rather than bypassed.
+    # -------------------------------------------------------------------------
+    mock-webhook:
+      enabled: false
+      callback-base-url: ${MOCK_WEBHOOK_BASE:http://localhost:8080}
+      hmac-secret: ${MOCK_WEBHOOK_SECRET:local-development-hmac-secret-not-a-real-key}
+      signature-header: X-Notification-Signature
+      timestamp-tolerance: 5m
+      delay:
+        min: 2s
+        max: 45s
+      out-of-order-rate: 0.05
+      duplicate-rate: 0.02
+      loss-rate: 0.01
+
+    # Runtime chaos control, backed by the ChaosState bean. Makes the failover
+    # story demonstrable in thirty seconds instead of describable in ten
+    # minutes:
+    #   POST /admin/v1/mock-providers/mock-sms-primary/chaos
+    #        {"mode":"HARD_DOWN","durationSeconds":120}
+    # See `make demo`.
+    mock-chaos:
+      enabled: false
+      admin-path: /admin/v1/mock-providers
+
+logging:
+  level:
+    root: INFO
+    dev.gaurav.notification: INFO
+    org.apache.kafka.clients.NetworkClient: WARN
+
+---
+spring:
+  config:
+    activate:
+      on-profile: local
+
+  # LOCAL ONLY — see app-api/src/main/resources/application.yml. Fixed
+  # credentials so Prometheus can scrape /actuator/prometheus before
+  # platform-security ships a SecurityFilterChain that permits it.
+  security:
+    user:
+      name: local
+      password: local
+      roles: ACTUATOR
+
+notification:
+  scheduler:
+    hydrator:
+      # Faster tick locally so a scheduled send in the demo lands in seconds
+      # rather than making a reviewer wait.
+      scan-interval: 2s
+    dispatch:
+      jitter: 2s
+      avoid-quarter-hour-marks: false
+
+logging:
+  level:
+    dev.gaurav.notification: DEBUG
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "*"

@@ -1,0 +1,319 @@
+# Scalability
+
+The capacity model, what saturates first, and the growth path from 1M to 50M users.
+
+Every number on this page is **derived from the model in
+[§2](superpowers/specs/2026-08-31-notification-platform-design.md#2-capacity-planning) and
+[§10](superpowers/specs/2026-08-31-notification-platform-design.md#10-scalability) of the design
+spec**. None of it is a measurement. The only measured numbers in this repository are listed in
+[STATUS.md](STATUS.md#measurements).
+
+---
+
+## 1. The capacity model
+
+### 1.1 Traffic derivation
+
+Two operating points are modelled throughout: a **base** case of 5M notifications/day and a
+**stretch** case of 100M/day.
+
+```
+Base:    5,000,000 / 86,400 =    57.9 notifications/s average
+Stretch: 100,000,000 / 86,400 = 1,157.4 notifications/s average
+```
+
+Fan-out is 60% transactional (1:1) and 40% campaign (mean 5,000 recipients base, 10,000 stretch):
+
+```
+Base requests/day    = 3,000,000  + (2,000,000  / 5,000)   = 3,000,400
+Stretch requests/day = 60,000,000 + (40,000,000 / 10,000)  = 60,004,000
+Blended fan-out      = 1.67 recipients per request
+```
+
+**The consequence is the single most important sizing fact in the system:** the API tier scales with
+*requests*, the dispatch tier with *notifications*. A campaign request is O(1) at the edge and
+O(10,000) behind it, so **expansion must never happen in the request thread**.
+
+That is why `AcceptNotificationUseCase` writes a request envelope and an outbox row and returns, and
+why `RequestFanOut` runs in the worker.
+
+### 1.2 Peak-to-average ratio
+
+Peak hour is 8.4% of daily volume; the intra-hour 5-minute burst factor is 1.49.
+
+```
+PAR = (0.084 × 24) × 1.49 = 2.016 × 1.49 = 3.00
+```
+
+| Metric | Base | Stretch |
+|---|---:|---:|
+| Peak notifications/s | 173.6 | 3,472.2 |
+| Peak API RPS | 104.2 | 2,083.5 |
+| Peak provider attempts/s (×1.128 retry) | 195.8 | 3,916.7 |
+
+### 1.3 The two bursts
+
+**Burst A — a 10M-recipient campaign in 15 minutes, landing on the 20:00 peak:**
+
+```
+10,000,000 / 900 s = 11,111 /s  +  diurnal peak 3,472 /s  =  14,583 notifications/s
+```
+
+12.6× the stretch average and **252× the base average. This is the design point.** Every partition
+count, pool size and instance type in this document exists to absorb Burst A.
+
+**Burst B — the scheduled cliff:** 25M scheduled sends a day, ~5% landing in one minute = 20,833/s.
+
+The mitigation costs one modulo and is already implemented in `ScheduleJitter`:
+
+```
+due_at += hash(notificationId) % 300s
+```
+
+Deterministic, so it survives restarts and stays idempotent. A 60-second cliff spreads over 5
+minutes → 4,167/s, which is now *smaller than Burst A* and therefore no longer the sizing constraint.
+
+### 1.4 Kafka throughput
+
+Message sizes include ~200 B of headers and ~60 B of record overhead. Large bodies are **not** in
+Kafka — an S3 pointer only (Claim Check).
+
+| Event | Bytes |
+|---|---:|
+| `requested` | 1,500 |
+| `dispatch` (blended) | 1,250 |
+| `delivery` | 700 |
+| `retry` | 1,400 |
+| `status` | 550 |
+| `dlq` | 2,050 |
+
+```
+Stretch: 604M records/day = 502 GB/day raw
+         peak = 17.43 MB/s × RF3 = 52.3 MB/s cluster write
+         after zstd 2.5:1 → 16.5 MB/s ingress
+Burst A: 57,222 msg/s, 41.2 MB/s raw → 16.5 MB/s compressed
+```
+
+**Bytes are never the constraint.** A single `express.m7g.large` broker is rated at 15 MB/s ingress.
+The constraints are **message rate**, **partition count** and **consumer concurrency** — which is
+exactly why `TopicPartitions` derives every partition count from measured consumer throughput and
+explicitly refuses to size on MB/s.
+
+### 1.5 PostgreSQL load
+
+Row-operations per notification: 1 INSERT `notification` + 0.4 `recipient` + 1.128 `attempt` +
+3 `event` + 3 status UPDATE = **8.528**.
+
+| | Base | Stretch |
+|---|---:|---:|
+| Peak row-ops/s | 1,481 | **29,611** |
+| Burst A + peak row-ops/s | — | **124,367** |
+| Storage growth | 9.9 GB/day | **197.5 GB/day (72 TB/yr)** |
+
+Read : write at peak is **1 : 14.8**. This is a write-dominated OLTP system, and that single fact
+drives the no-index-on-`status` decision, the HOT-update `fillfactor`, the absence of foreign keys on
+hot tables, and the choice to keep events out of the primary later.
+
+### 1.6 Redis / Valkey load
+
+| Use | Peak ops/s | Memory |
+|---|---:|---:|
+| Idempotency (24 h TTL) | 2,083 | 10.20 GB |
+| Dedup set | 14,583 | 17.00 GB |
+| Preferences (7 d TTL) | 14,583 | 5.00 GB |
+| Templates, rate limits, circuit state, locks, timers | ~4,600 | 0.85 GB |
+| **Naive total ×1.35 overhead** | **35,847** | **44.62 GB** |
+
+Two levers reduce that to **11.50 GB**: idempotency TTL 24 h → 6 h, and the exact dedup set replaced
+by a cuckoo filter at 1.2 B/entry.
+
+### 1.7 Infrastructure sizing
+
+| | Base (5M/day) | Stretch (100M/day) |
+|---|---|---|
+| MSK | 3 × `kafka.m7g.large`, 200 GB | **6 × `kafka.m7g.xlarge`, 1 TB, 288 partitions** |
+| RDS | `db.r7g.xlarge` Multi-AZ, 1 TB | **`db.r7g.8xlarge` Multi-AZ, 16 TiB, 30k IOPS, 2 replicas** |
+| ElastiCache | 1 shard × `r7g.xlarge` + replica | **3 shards × `r7g.xlarge` + replicas** |
+| EKS | ~6 × m7g.2xlarge | ~18 average (KEDA elastic) |
+| **Est. monthly AWS** | ~$4,600 | ~$30,500 naive / **~$19,700 levered** |
+
+Broker CPU is sized on **message rate**, not bytes:
+
+```
+Burst A: 57,222 msg/s ingress × 3 (including replication fetch) = 171,666 msg/s handled
+÷ 12,000 msg/s per vCPU at a 60% target = 14.3 vCPU
+
+6 × kafka.m7g.xlarge = 24 vCPU → 60% utilised.
+m7g.large (12 vCPU)  = 119%     → insufficient.
+```
+
+Broker storage:
+
+```
+967 GB retained single copy × RF3 = 2,901 GB ÷ 6 brokers = 483.5 GB
+÷ 0.60 headroom = 806 GB → provision 1 TB/broker
+```
+
+*Cost caveat carried from the spec: MSK broker/storage rates and the EKS control-plane price are
+verified against AWS docs; several RDS and ElastiCache instance rates are linear extrapolations and
+are labelled estimates.*
+
+---
+
+## 2. The finding that reframes the project
+
+```
+Provider fees at stretch (monthly):
+  SMS    300,000,000 × $0.0079 = $2,370,000
+  EMAIL  900,000,000 × $0.0001 =    $90,000
+  PUSH                          =         $0
+                         TOTAL  = $2,460,000
+
+AWS infrastructure              =    $30,500   (1.2% of TCO)
+```
+
+**A 20% SMS→push down-route saves $474,000/month — 15× the entire AWS bill.**
+
+The highest-leverage engineering in this system is the **routing engine and the suppression
+pipeline**, not broker tuning. That is why `HealthWeightedSelectionStrategy` carries a cost term at
+all, why `MeteredProvider` maintains a `notification.provider.cost.micros` counter, and why the
+executive dashboard has a cost-per-1k panel.
+
+It is also why cost is deliberately the *smallest* weight in the routing score (0.10): a router that
+optimises the invoice ahead of delivery will find the cheapest way to not deliver a password reset.
+
+**Say in an interview:** *"The AWS bill is 1.2% of total cost of ownership. Provider fees are 2.4
+million a month against thirty thousand of infrastructure. So the routing engine matters roughly
+fifteen times more than anything I could do to the Kafka cluster, and the design says that out
+loud."*
+
+---
+
+## 3. Growth path: 1M → 50M users
+
+| Scale | Volume | Kafka | Postgres | Redis | First thing that breaks |
+|---|---|---|---|---|---|
+| **1M users** | 1M/day | 3 × m7g.large | `r7g.large` | 1 × `r7g.large` | **Provider quotas.** Nothing we own is stressed |
+| **10M users** | 10M/day | 3 × m7g.large | `r7g.2xlarge` + replica | 1 shard `r7g.xlarge` | **`notification_event` write amplification** — move events off Postgres *here*, not at 100M |
+| **50M users** | **100M/day** | **6 × m7g.xlarge, 288 partitions** | **`r7g.8xlarge`, 16 TiB, 2 replicas** | **3 shards** | **PG primary during campaigns** (124,367 vs 179,200 ops/s max) |
+| **50M users** | 500M–1B/day | 12 × m7g.2xlarge + tiered storage | **Citus, 16 shards**; attempts + events in ClickHouse | 12 shards | Provider quotas again |
+
+The two ends of that table say the same thing: **provider quotas bracket the whole design.** Between
+them, the interesting engineering is keeping PostgreSQL's write path inside its envelope.
+
+At 1M/day nothing this platform owns is under pressure — the correct answer at that scale is not to
+build this platform. It is worth saying so.
+
+---
+
+## 4. The bottleneck ladder
+
+What saturates first, in order. The ordering is the point: **AWS infrastructure is sixth.**
+
+### 1. Provider quotas — ~200–500 msg/s per account
+
+Hit at roughly **17M/day**. This is the true system cap; everything below it is secondary.
+
+Levers: multi-provider routing (already built), negotiated quota increases, SES dedicated IPs, and —
+the big one for SMS — short codes at ~1,000/s against long codes at ~1/s.
+
+*Nothing in the software fixes this. It is a commercial constraint that the architecture must be
+shaped around, which is why the router and the SPI exist before anything else.*
+
+### 2. PostgreSQL write path — ~30k ops/s, or any single 10M campaign
+
+Levers in the order they should be pulled:
+
+| Lever | Saving | Note |
+|---|---|---|
+| `notification_event` → Kafka/S3 | −35% of row-ops | Do this at **10M users**, not at 100M |
+| Collapse 3 status UPDATEs → 1 | −24% | Batch the transitions a single dispatch produces |
+| `COPY` for campaign expansion | large | Replaces per-row INSERT during fan-out |
+| `fillfactor=85` for HOT updates | write amplification | Already applied on the outbox at 70 |
+| Shard by `tenant_id` | horizontal | Last resort; see §5 |
+
+### 3. Dispatch consumer parallelism — 21,600/s
+
+Parallel Consumer in `KEY` mode gives roughly **4× for free**, because ordering is only required per
+`(tenant, recipient, channel)` and the current one-thread-per-partition model is far stricter than
+the contract needs.
+
+### 4. Redis single-shard CPU — ~100k cmd/s
+
+Lease-based rate limiting turns 18,500 ops/s into ~200: a pod leases a block of permits instead of
+asking per message. The `RateLimiter` interface already permits this — `tryAcquire(key, permits)`
+takes a permit count.
+
+### 5. Pod scale-from-zero — 60–120 s
+
+**Pre-warm on campaign schedule.** The scheduler already knows a 10M blast is due at 20:00, so scale
+at 19:55. This is the cheapest item on the ladder and the one most systems miss, because they treat
+autoscaling as purely reactive.
+
+Related: lag-driven autoscaling is a feedback loop pointed the wrong way during a *provider* outage.
+Lag climbs because sends are failing; scaling out adds workers that hammer a provider that is already
+down. Scale-out must be gated on provider health.
+
+### 6. MSK brokers — ~300k msg/s
+
+Sixth. Note that.
+
+---
+
+## 5. When to shard, and on what
+
+**Shard when any one of these is true:**
+
+- Hot-window storage exceeds **20 TB** (~400M/day)
+- Sustained writes exceed **120k/s** including the worst concurrent campaign
+- A partition's autovacuum cannot finish within the retention window
+- Failover or restore RTO exceeds the SLO
+
+**Shard key = `tenant_id`.** Every read path is already tenant-scoped and the HASH sub-partitioning
+is already on it, so the key is not a new decision — it is one that was made in `V1__baseline.sql`.
+
+**Move `delivery_attempt` and `notification_event` to a columnar store *before* sharding.** It is
+cheaper, simpler, and buys more — see [ADR-012](adr/ADR-012-analytics-deferred.md). Sharding a
+relational primary is a one-way door; moving two append-only tables is not.
+
+### The single-primary ceiling
+
+```
+64 vCPU × 4,000 ops/s × 0.70 ÷ 8.528 ops/notification ÷ PAR 3 × 86,400
+  ≈ 605M notifications/day theoretical
+```
+
+Binding constraints bite earlier: **Burst A capacity at ~100M/day**, storage at ~400M/day. After
+levers 1 and 2 above (3.528 ops/notification): **~1.46B/day** on CPU.
+
+The point of computing this is to know that a single PostgreSQL primary is *not* the thing that
+forces sharding at this scale. Burst absorption and storage are.
+
+---
+
+## 6. What the code already does about all of this
+
+| Model constraint | Where it shows up in the code |
+|---|---|
+| API scales on requests, dispatch on notifications | `AcceptNotificationUseCase` never expands recipients; `RequestFanOut` runs in the worker |
+| Burst B, the scheduled cliff | `ScheduleJitter` — deterministic 300 s spread, CRITICAL exempt |
+| Kafka sized on message rate, not bytes | `TopicPartitions` — the formula and every consumer rate are in the Javadoc |
+| Hot partitions are bugs, not hashing problems | `PartitionKeys` — `recipientId` in the dispatch key, no time component, no custom partitioner |
+| Write-dominated OLTP | No index on `notification.status`; partial indexes; `fillfactor=70` on the outbox; no FKs on hot tables |
+| Provider quotas are the real cap | `RateLimitedProvider` stage in the chain; `ProviderCandidate.rateLimitRps` |
+| Cost matters 15× more than infra | `MeteredProvider` cost counter; cost term in the routing score |
+| Retry amplification | `RetryBudget` — 10% of successes, hard ceiling |
+
+---
+
+## 7. What is not modelled
+
+Stated so the gaps are visible:
+
+- **No measured throughput.** Everything above is arithmetic. See [LOAD-TEST.md](LOAD-TEST.md).
+- **Multi-tenancy fairness** beyond per-tenant quotas. A single tenant can still saturate one
+  provider *account*; the mitigation is per-tenant credentials for tier-1 tenants, which is design
+  only.
+- **Cross-region capacity.** Single region with warm DR — [ADR-016](adr/ADR-016-single-region.md).
+- **Template rendering cost.** `EchoTemplateRenderer` returns the body unchanged, so the CPU cost of
+  a real engine is not in any of these numbers.

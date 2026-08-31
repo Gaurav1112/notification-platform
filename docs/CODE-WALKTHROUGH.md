@@ -6,7 +6,13 @@ way, and what to say about it. Grows with the repo.
 **Prerequisite reading:** [UNDERSTANDING-THE-DESIGN.md](UNDERSTANDING-THE-DESIGN.md) for the
 *why*, this document for the *how*.
 
-Progress: **Phase 1 of 11** · 22 Java files · 16 tests green · schema verified on PostgreSQL 18.6
+Progress: **11 modules built** · 273 main + 63 test Java files · **392 tests green** (371 without
+Docker, 392 with `-Pintegration`) · schema verified on PostgreSQL 18.6
+
+> **Read [STATUS.md](STATUS.md) alongside this.** Three of the six provider decorators are
+> deliberate pass-throughs today, and `app-api` cannot boot because its three inbound ports have no
+> adapters. Both are called out in place below. This document explains what the code *does*, and it
+> says so plainly when the answer is "nothing yet, and here is why the seam exists anyway".
 
 ---
 
@@ -338,17 +344,1276 @@ Two details that matter at throughput:
 
 ---
 
-## What's next
+## Part 3 — The provider SPI
 
-| Phase | Deliverable |
+`platform-provider/src/main/java/dev/gaurav/notification/provider/spi/`
+
+Everything downstream of the workers talks to exactly one interface:
+
+```java
+public interface NotificationProvider {
+    Channel channel();
+    ProviderCode code();
+    ProviderCapabilities capabilities();
+    SendResult send(SendCommand command);
+    boolean isHealthy();
+}
+```
+
+Five methods. That is the entire contract a vendor integration has to satisfy.
+
+### `SendResult` is a sealed interface with three cases, not two
+
+```java
+public sealed interface SendResult permits Accepted, Rejected, Indeterminate {
+    record Accepted(String providerMessageId, Duration latency, long costMicros) ...
+    record Rejected(FailureType type, String code, String message,
+                    Duration latency, Optional<Duration> retryAfter) ...
+    record Indeterminate(FailureType type, String message, Duration latency) ...
+}
+```
+
+The third case is the whole point. Almost every provider SDK in the wild gives you two outcomes —
+it worked, or it threw. `Indeterminate` says *the request was on the wire and we never heard back*.
+It is a different thing from failure, and treating it as failure is what produces three one-time
+passcodes for one login.
+
+Making the interface `sealed` means the compiler knows there are exactly three. Nobody can add a
+fourth outcome in a vendor adapter and have the rest of the platform silently ignore it.
+
+**Say in an interview:** *"The SPI has three outcomes, not two. Accepted, Rejected, and
+Indeterminate — the provider might have sent it and we don't know. That third case is where every
+duplicate-SMS incident lives, so I made it a first-class return value instead of an exception."*
+
+### Adapters must never throw
+
+`send` returns a value for every business outcome. If an adapter throws, that is a bug in the
+adapter, and the platform treats it as one — see `TimeoutProvider.ProviderAdapterException` below.
+This is not politeness. Exceptions carry no `retryAfter`, no cost, no latency, and no
+classification, so an adapter that throws forces every caller to re-derive information the adapter
+already had.
+
+---
+
+## Part 4 — The decorator chain
+
+`platform-provider/.../decorator/ProviderDecoratorChain.java`
+
+A leaf adapter contains vendor logic and nothing else. Everything that must be true of *every*
+provider is a decorator, applied identically to a mock and to a real vendor:
+
+```
+Traced  →  Metered  →  CircuitBreaker  →  RateLimited  →  Timeout  →  Idempotent  →  adapter
+```
+
+The builder assembles that order **regardless of the order the builder methods are called in**.
+That is the reason the class exists — decorator order has observable consequences, and a caller
+wiring it by hand gets it subtly wrong once and nobody notices for six months.
+
+### Every boundary earns its position
+
+| Boundary | Why |
 |---|---|
-| **2** | JPA entities + repositories + Testcontainers repository tests |
-| **3** | The accept path — `POST /notifications`, idempotency with fingerprint, outbox in one transaction |
-| **4** | Provider SPI, decorator stack, mock providers with seeded failure injection |
-| 5 | Kafka producers/consumers, idempotent receiver |
-| 6 | Channel workers, retry engine, DLQ |
-| 7 | Scheduler: hydrator + shard-affine claimers |
-| 8 | Webhooks, status processor, reconciler |
-| 9 | Preferences, templates, suppression |
-| 10 | Observability: metrics, dashboards, alert rules |
-| 11 | Load tests with measured results |
+| **Traced outermost** | The span must cover time spent on *our own* limiter and pool, or the trace blames the vendor for latency we created |
+| **Metered above the breaker** | A short-circuited call is an outcome the caller experienced. Measured *below* the breaker, an open circuit looks like zero traffic and 100% health — exactly backwards |
+| **Breaker above rate limiter** | A rate-limit rejection is our back-pressure, not evidence the provider is ill |
+| **Rate limiter above timeout** | The deadline exists to bound the *provider*. Time queued for one of our own tokens must not consume the vendor's budget |
+| **Timeout above idempotent** | The token must be written before the clock can cut the call off. A timed-out call is precisely the case where that record is the only evidence a send happened |
+
+**Say:** *"Decorator order isn't style. If the metrics decorator sits inside the circuit breaker,
+an open circuit reports zero traffic and a perfect success rate — the dashboard says the provider
+is healthy at the exact moment you've stopped calling it."*
+
+### `TimeoutProvider` — the one that prevents a rebalance storm
+
+```java
+try {
+    return inFlight.get(budget.toMillis(), TimeUnit.MILLISECONDS);
+} catch (TimeoutException e) {
+    inFlight.cancel(true);                       // interrupt, so a sleeping adapter frees its thread
+    return new SendResult.Indeterminate(FailureType.PROVIDER_TIMEOUT,
+            "no response from " + code() + " within " + budget.toMillis() + "ms",
+            elapsedSince(startedAt));
+}
+```
+
+An HTTP client's socket timeout does not cover connection-pool acquisition, DNS or TLS, so "5
+second read timeout" routinely becomes a 90-second call. On a Kafka consumer that blows through
+`max.poll.interval.ms`, the group rebalances, the in-flight batch is redelivered — and one slow
+provider becomes a cluster-wide stall *plus* duplicate sends.
+
+Two details worth pointing at:
+
+```java
+var pool = new ThreadPoolExecutor(threads, threads, 0L, MILLISECONDS,
+        new ArrayBlockingQueue<>(queueDepth), factory, new ThreadPoolExecutor.AbortPolicy());
+```
+
+Never `ForkJoinPool.commonPool()`. Its width is `availableProcessors() - 1`, which on a 2-vCPU
+container is **one thread**, shared with every parallel stream in the JVM. And the queue is tiny on
+purpose:
+
+```java
+} catch (RejectedExecutionException e) {
+    // Parking the calling thread until a slot frees would hand the provider's backlog
+    // straight to our Kafka consumer.
+    return SendResult.Rejected.of(FailureType.RATE_LIMITED, "LOCAL_POOL_SATURATED", …);
+}
+```
+
+Shedding to the next candidate beats queueing, because `RATE_LIMITED` fails over immediately
+without burning an attempt.
+
+**Say:** *"The failure I was protecting against is a slow provider becoming a Kafka rebalance
+storm. A hung vendor call blocks the poll loop, the broker declares the consumer dead, partitions
+get reassigned mid-flight, and now you have duplicate sends caused by a timeout you didn't set."*
+
+### `IdempotentProvider` — record before you call
+
+```java
+var previous = tokenLog.previousOutcome(code(), token);
+if (previous.isPresent() && previous.get().isSuccess()) {
+    return previous.get();
+}
+// Deliberately before the call, and deliberately not conditional on the return value:
+// a crash on the next line must still leave evidence that a send was started.
+tokenLog.recordAttempt(code(), token, clock.instant());
+var result = delegate.send(command);
+tokenLog.recordOutcome(code(), token, result);
+```
+
+Only `Accepted` short-circuits. A previous `Indeterminate` **must** be allowed through to the
+caller's own policy — silently treating "we do not know" as "already sent" would drop real
+messages.
+
+### Three decorators are pass-throughs today
+
+`CircuitBreakerProvider`, `RateLimitedProvider` and `TracedProvider` currently forward to their
+delegate and carry a `TODO` describing exactly what they must do. This is deliberate and it is
+worth being able to defend:
+
+- The **circuit breaker logic exists and is tested** in `platform-resilience`
+  (`ProviderCircuitBreakerConfiguration`, `ProviderCircuitBreakers`, `FailureClassifier`), and the
+  worker's `ChannelProviderRouter` filters open circuits out of the candidate list. What is missing
+  is the *decorator* wiring, not the breaker.
+- The **rate limiter exists** (`RedisTokenBucketRateLimiter`) and is tested.
+- Keeping the empty decorators in the chain means the order never changes when they are filled in.
+  A stage added later has to be inserted somewhere, and "somewhere" is where the mistake happens.
+
+**Say:** *"Three of the six decorators are stubs with the policy written into the Javadoc. The
+components they'll delegate to are built and tested — the breaker, the classifier, the limiter. I
+kept the empty stages in the chain so the ordering doesn't move when they're wired, because
+inserting a stage into an existing chain is where the ordering bug gets introduced."*
+
+---
+
+## Part 5 — The mock providers and deterministic failure injection
+
+`platform-provider/.../mock/`
+
+There are no vendor credentials in this repository, and that is
+[ADR-005](adr/ADR-005-mock-providers.md), not a shortcut. Only the **leaf adapter** is mocked; the
+SPI, the decorators, the router, the breaker, the retry engine and the status pipeline are all
+real.
+
+### The mocks emulate vendor *semantics*, not a stub
+
+```java
+case RATE_LIMITED -> new SendResult.Rejected(FailureType.RATE_LIMITED, "Throttling",
+        "Maximum sending rate exceeded", latency, Optional.of(THROTTLE_RETRY_AFTER));
+case INVALID_RECIPIENT, DEVICE_UNREGISTERED -> SendResult.Rejected.of(
+        FailureType.INVALID_RECIPIENT, "Bounce.Permanent.General",
+        "550 5.1.1 recipient address does not exist", latency);
+```
+
+`MockEmailProvider` declares `supportsBatching = true, maxBatchSize = 50` because SES's
+`SendBulkEmail` really does cap at 50 destinations and really does return per-destination status.
+`MockPushProvider` models FCM's per-token requests and `UNREGISTERED`. `MockSmsProvider` models
+Twilio's error codes and the fact that Twilio offers **no client idempotency key at all**.
+
+That mapping — profile → vendor error code → `FailureType` — is exactly the code a real integration
+has to write, so it is the code worth testing.
+
+### Why the RNG is re-seeded per call
+
+```java
+static long seedFor(long baseSeed, ProviderCode provider, UUID recipientId, int attempt) {
+    var h = mix(baseSeed);
+    h = mix(h ^ fnv1a(provider.value()));
+    h = mix(h ^ recipientId.getMostSignificantBits());
+    h = mix(h ^ recipientId.getLeastSignificantBits());
+    return mix(h ^ attempt);
+}
+```
+
+The obvious implementation — one shared `Random`, `nextDouble()` per send — is reproducible only in
+a single-threaded run. The moment sixteen worker threads pull from the same stream, draw *n* goes
+to whichever thread got there first, and "exactly three messages reached the DLQ" becomes a flaky
+assertion someone eventually deletes.
+
+Seeding from `(base, provider, recipient, attempt)` makes the outcome of a send a **pure function
+of its identity**: independent of thread, of ordering, of how many messages are in flight. That is
+what makes an exact DLQ count a legitimate assertion — see `DeterministicFailureInjectionTest`.
+
+The **attempt** is in the key on purpose. Without it, a retry draws the same outcome forever, a
+`TRANSIENT_NETWORK` failure can never recover, and the retry engine is untestable.
+
+### Why log-normal latency
+
+```
+mu    = ln(median)
+sigma = (ln(p99) - mu) / z(0.99),   z(0.99) = 2.3263478740408408
+ms    = exp(mu + sigma * gaussian)
+```
+
+Real provider latency is long-tailed. A uniform draw between two bounds has essentially no tail, so
+it never populates a realistic p99 bucket and never trips a latency-based breaker — which makes
+every latency test pass and every latency alert untested. The parameters are solved from the two
+numbers an operator actually knows: the median and the p99.
+
+### `SILENT_SUCCESS` — the profile the whole enum exists for
+
+```java
+if (draw.profile() == FailureProfile.SILENT_SUCCESS) {
+    var overshoot = command.deadline().plus(SILENT_SUCCESS_OVERSHOOT);
+    sleeper.sleep(overshoot);
+    return new SendResult.Indeterminate(FailureType.PROVIDER_TIMEOUT,
+            code + " acknowledged after the deadline; delivery state unknown", overshoot);
+}
+```
+
+The provider takes longer than our deadline and then succeeds anyway. Every duplicate-OTP incident
+lives in that gap. A mock that cannot produce the gap cannot test the code that closes it.
+
+### Chaos is bounded, always
+
+```java
+public static final Duration MAX_DURATION = Duration.ofHours(1);
+```
+
+Every injected fault has an expiry, and a fat-fingered `"durationSeconds": 1200000` is clamped. A
+fault with no deadline is how a shared demo environment stays broken until somebody remembers what
+they did on Tuesday.
+
+**Say:** *"The mocks are seeded from the message identity rather than from a shared stream, so a
+test can assert 'exactly three of these reach the DLQ' and it holds under sixteen threads. Latency
+is log-normal because a uniform distribution has no tail, and a p99 alert you never populate is an
+alert you never tested."*
+
+---
+
+## Part 6 — The retry engine
+
+`platform-resilience/.../retry/`
+
+Three independent controls, because each fixes a different failure: **jitter** fixes *when* retries
+land, the **tier topics** fix *where* they wait, and the **budget** fixes *how many* there are. Any
+two without the third still produce an outage.
+
+### Why FULL jitter and not "backoff plus noise"
+
+```java
+FULL {
+    public Duration computeDelay(int attempt, Duration initial, Duration max,
+                                 double multiplier, Random rng) {
+        return Duration.ofMillis(nextLongBounded(rng, ceilingMillis(attempt, initial, max, multiplier)));
+    }
+}
+```
+
+`random(0, backoff)`. Not `backoff ± noise`.
+
+A provider outage does not fail one message, it fails everything in flight. With 100,000 messages
+failing inside the same second and a deterministic backoff, all 100,000 compute **the same** delay
+and retry at the same instant. The provider comes back, is hit by 100,000 simultaneous requests,
+and falls over again — and because the second failure is also synchronised, the herd stays in
+lockstep. The retry traffic, not the original fault, keeps the provider down.
+
+A symmetric band around the deterministic value **narrows the spike, it does not remove it.** Full
+jitter spreads the same 100,000 uniformly across the whole window, so the recovering provider sees
+a ramp instead of a wall.
+
+The cost is that one message's individual latency gets noisier. That is the correct trade: the
+platform optimises for the recovery time of the fleet, not the p50 of one retry.
+
+`EQUAL` and `DECORRELATED` are also implemented; `NONE` exists specifically so the stampede can be
+*demonstrated* in a test rather than argued about.
+
+### `Retry-After` is a floor, never a replacement
+
+```java
+return Optional.of(retryAfter.filter(after -> after.compareTo(jittered) > 0).orElse(jittered));
+```
+
+`max(jittered, retryAfter)`. Taking the header verbatim would put every throttled message back on
+the wire at exactly the same instant — the provider told all of them the same number, which is the
+stampede jitter exists to prevent. Ignoring it entirely earns a longer ban.
+
+### Why delay *topics* and not `Thread.sleep()`
+
+```java
+T5S (Duration.ofSeconds(5),  "notification.retry.5s"),
+T30S(Duration.ofSeconds(30), "notification.retry.30s"),
+T2M (Duration.ofMinutes(2),  "notification.retry.2m"),
+T10M(Duration.ofMinutes(10), "notification.retry.10m"),
+T1H (Duration.ofHours(1),    "notification.retry.1h");
+```
+
+Sleeping inside a Kafka consumer is wrong for two independent reasons:
+
+1. **It holds the partition.** Every healthy message behind the sleeping one waits too.
+2. **It breaks `max.poll.interval.ms`.** Kafka measures liveness by the gap between `poll()` calls
+   — 300 s here. The 10 m and 1 h tiers obviously exceed it. The broker declares the consumer dead,
+   the group rebalances, in-flight partitions are revoked and reassigned. Under a provider outage
+   *every* consumer sleeps at once, so the whole group thrashes at the moment it must stay stable.
+
+**KIP-62 moved heartbeats to a background thread**, so the consumer *keeps heartbeating and looks
+perfectly alive* the whole time. That is why this gets debugged as a broker problem for hours.
+Raising the interval is not the fix — it costs failover time, and worst-case rebalance detection
+then takes up to twice the interval.
+
+Rounding is *up*, never nearest:
+
+```java
+public static RetryTier nearestFor(Duration delay) {
+    for (RetryTier tier : values()) {
+        if (tier.delay.compareTo(delay) >= 0) return tier;
+    }
+    return T1H;
+}
+```
+
+A 17 s backoff is arithmetically closer to 5 s than to 30 s, so "closest" would fire 12 s early and
+hand the failing provider back the load the backoff was calculated to withhold.
+
+### `RetryTierListener` — pause the partition, don't sleep
+
+The worker's tier consumer does **no external I/O at all**. It `seek`s the record back, pauses the
+partition, re-polls until `ready_at`, re-checks eligibility (cancelled? expired?) and republishes.
+A paused partition still gets polled — the poll simply returns nothing for it — so the poll interval
+is never breached and no rebalance happens. The offset was never committed, so a pod that dies while
+paused loses nothing.
+
+Messages **hop** tiers rather than waiting in one, because a partition is FIFO: a message waiting an
+hour at the head of the 5-second lane would stall everything behind it. Head-of-line blocking within
+a tier is therefore bounded by that tier's own delay, which is also what makes it safe to share five
+tiers across three channels.
+
+### `RetryBudget` — the control most systems are missing
+
+```java
+public boolean tryAcquire() {
+    while (true) {
+        long current = milliTokens.get();
+        if (current < MILLI_TOKEN) { throttled.increment(); return false; }
+        if (milliTokens.compareAndSet(current, current - MILLI_TOKEN)) return true;
+        // Lost the race; re-read. Never spin on a stale value — that is how
+        // two threads both spend the last token.
+    }
+}
+```
+
+A token bucket that caps retries at 10% of *successful* calls, so a failing provider is never handed
+**more** load than when it was healthy.
+
+Backoff and jitter fix *when*; neither fixes *how many*. In a five-layer call stack where every
+layer retries three times, one user request becomes up to 3⁵ = 243 calls at the bottom. Every layer
+is individually reasonable, and the dependency that was merely degraded is now receiving 243× its
+normal traffic.
+
+The counterweight: retries buy far less than intuition suggests. Segment published measurements
+showing only about **1.5%** of deliveries eventually succeeded on a retry. Spending unbounded
+capacity chasing 1.5% — while that spend is exactly what prevents the other 98.5% from recovering —
+is a bad trade at any scale.
+
+When the provider is healthy, successes vastly outnumber retries and the budget is never felt. When
+it fails, deposits stop, the bucket drains in bounded time, and retries switch off automatically —
+no operator, no feature flag, no deploy.
+
+Tokens are held as thousandths (`MILLI_TOKEN = 1_000`) so a 10% deposit is exact integer arithmetic;
+accumulating a `double` across billions of CAS operations drifts.
+
+**Say:** *"Three separate controls. Full jitter for when, tiered delay topics for where they wait,
+and a token-bucket budget for how many. Jitter alone still lets retries amplify — the classic
+number is 3⁵ = 243 calls at the bottom of a five-layer stack, and every layer looks reasonable in
+isolation."*
+
+### `RetryRouter` — order of checks is the policy
+
+`app-worker/.../retry/RetryRouter.java`
+
+1. **Indeterminate, first** — an unknown outcome is not a failure and must not enter a failure
+   ladder. For SMS this ends the decision: Twilio offers no reconciliation, so a retry is an
+   unrecoverable duplicate.
+2. **Expired, second** — a dead message is not worth classifying or spending a token on.
+3. **Failover, third — above the retryable check.** `AUTH_FAILURE` is *not retryable*; if the
+   retryable test came first the message would be dropped while a healthy secondary sat right
+   there. Revoked credentials are a property of our account with one vendor, not of the message.
+4. **Permanent, fourth.**
+5. **Budget, fifth** — before the attempt ladder, so a token is not spent on a message the ladder
+   was going to refuse anyway.
+6. **The ladder, last.** Attempts exhausted means the DLQ.
+
+Moving any one of those up or down changes a real outcome. That is why they are numbered in the
+Javadoc rather than just written in order.
+
+---
+
+## Part 7 — The circuit breaker and the half-open stampede
+
+`platform-resilience/.../circuitbreaker/`
+
+### The numbers, and why each one
+
+```java
+public static CircuitBreakerSettings defaults() {
+    return new CircuitBreakerSettings(50f, 20, 60, Duration.ofSeconds(30), 3);
+}
+```
+
+| Setting | Why |
+|---|---|
+| **50% failure rate** | A provider failing half its calls is unusable; a lower threshold trips on noise. SMS routes fail a few percent permanently (dead numbers) even when healthy |
+| **20 minimum calls** | Without a floor, the first two calls after a deploy failing gives a 100% rate on a sample of two. **The single most common circuit breaker misconfiguration** |
+| **60 s time-based window** | Count-based windows lie on a low-traffic channel: the last 100 calls can span an hour, so the breaker opens on failures fixed 50 minutes ago |
+| **30 s open** | Long enough for a restart, short enough not to cost meaningful latency — and jittered, see below |
+| **3 half-open probes** | Enough signal to distinguish recovery from a fluke. Note this is *per JVM* |
+
+### A 4xx must never trip the breaker
+
+```java
+public static boolean shouldRecordAsCircuitFailure(FailureType type) {
+    return switch (type) {
+        case TRANSIENT_NETWORK, PROVIDER_TIMEOUT, PROVIDER_5XX,
+             AUTH_FAILURE, QUOTA_EXCEEDED -> true;
+        case RATE_LIMITED,
+             INVALID_RECIPIENT, DEVICE_UNREGISTERED, UNSUBSCRIBED, CONTENT_REJECTED,
+             TEMPLATE_ERROR, PAYLOAD_TOO_LARGE, PERMANENT_UNKNOWN -> false;
+    };
+}
+```
+
+An HTTP 400 because a template rendered a malformed E.164 number is **our** bug. The provider
+answered correctly and quickly; it is completely healthy. Count it and one bad campaign — every
+message malformed the same way — drives the failure rate to 100%, opens the circuit, and takes a
+working provider offline for every other tenant. The blast radius of a content bug becomes a
+channel-wide outage, and the metric that should say "your payloads are wrong" instead says "Twilio
+is down".
+
+The rule: *a breaker exists to stop calls that cannot succeed because the remote side is broken. If
+a different, well-formed request would succeed right now, the failure is ours.*
+
+Two nuances worth knowing:
+
+- **`RATE_LIMITED` is excluded** even though 429 is transient. A 429 says *we* are sending too fast.
+  Recording it means exceeding a quota by one call takes the provider offline for 30 seconds —
+  turning a throttle into an outage.
+- **`AUTH_FAILURE` and `QUOTA_EXCEEDED` are included** despite arriving as 4xx. They are
+  *account-scoped*, not message-scoped: every call with revoked credentials will fail, so opening
+  the circuit is exactly right.
+
+### The half-open stampede, and the cheap fix
+
+```java
+Duration jitteredWaitDuration(Duration base) {
+    long baseMillis = base.toMillis();
+    return Duration.ofMillis(baseMillis + jitterSource.nextLong(baseMillis));
+}
+```
+
+`permittedNumberOfCallsInHalfOpenState` is enforced **inside a single JVM**. Nothing in Resilience4j
+coordinates across pods.
+
+A provider outage fails calls on all 40 worker pods at roughly the same second, so all 40 breakers
+open at roughly the same second — and 30 seconds later all 40 transition to HALF_OPEN at roughly the
+same second and each admits its 3 probes. The recovering provider takes **120 synchronised probes**
+in one instant instead of the 3 the configuration appears to promise. Enough of them fail, all 40
+re-open together, and the fleet settles into a 30-second oscillation that keeps the provider down.
+**The configured number is off by a factor of the fleet size, and the fleet size is exactly what
+grows during an incident.**
+
+The fix here is deliberately the cheap one: each JVM adds a uniform random offset of up to the base
+wait, drawn **once at startup**. Forty pods then probe spread across a 30–60 s band. `SecureRandom`
+rather than a seeded `Random` specifically so identical pods rolled from one image do not draw
+identical offsets — a seeded PRNG would reproduce the very synchronisation this breaks.
+
+Two alternatives were considered and are named in the Javadoc: publishing aggregate breaker state to
+Redis at 1 Hz (true fleet coordination, but it does not desynchronise the probe *instant* and it puts
+a dependency on the failure path), and a distributed lock around the probe (correct, and far too
+expensive for a 3,900 calls/s hot path).
+
+### Granularity: one breaker per `(provider, channel)`
+
+```java
+public static String name(String providerCode, Channel channel) {
+    return providerCode + ":" + channel.name().toLowerCase();     // twilio:sms
+}
+```
+
+One breaker per *provider* would trip SES's push endpoint because its email quota was exceeded. One
+breaker per *channel* would open on the aggregate of three providers and remove the failover target
+along with the failing provider — the exact opposite of what a breaker is for.
+
+**Say:** *"The subtle bug is that half-open is per-JVM. Forty pods each admitting three probes is
+120 probes hitting a recovering provider simultaneously, they fail, everything re-opens together,
+and you've built a 30-second oscillator. I jitter the open-state duration per pod at startup so the
+probes spread across a band."*
+
+### `automaticTransitionFromOpenToHalfOpenEnabled(true)`
+
+Without it, the breaker only leaves OPEN when a call arrives. On a channel that goes quiet *because*
+upstream shed the load, nothing ever probes, and the provider stays fenced off long after it
+recovered.
+
+---
+
+## Part 8 — Kafka
+
+`platform-messaging/`
+
+### 16 topics, 288 partitions, and none of the numbers are round
+
+```
+P = ceil( peakRate / consumerRatePerPartition × 1.30 × K )   rounded up to a multiple of 3
+
+1.30 = operational headroom (broker restart, rolling upgrade, rebalance)
+K    = 1.5 for KEYED topics   — increasing partitions re-maps murmur2(key) % N and
+                                permanently breaks per-key ordering across the boundary
+     = 1.0 for unkeyed topics — --alter --partitions is safe and online
+3    = availability zones
+```
+
+Partition count is the one Kafka decision you cannot cheaply change later, which is why keyed topics
+are over-provisioned by 1.5× up front.
+
+The binding input is **measured work per message, never bytes**. Even at 100M/day with a 10M campaign
+superimposed the cluster ingests ~16.5 MB/s compressed — a single broker handles that. *Sizing Kafka
+by MB/s produces a cluster roughly 5× short on partitions and 2× oversized on brokers.*
+
+```java
+public static final int DISPATCH_SMS_TX     = 12;   // 80/s per partition — the slowest consumer
+public static final int DISPATCH_PUSH_BULK  = 54;   // widest: FCM removed its batch endpoint in 2024
+public static final int RETRY_5S            = 24;   // sized for a TOTAL provider outage (9,861/s)
+public static final int DLQ                 =  6;   // a busy DLQ is an incident, not a capacity problem
+```
+
+`notification.retry.5s` is sized for a **total provider outage**, not the 12.8% steady retry rate.
+Retry tiers are the shock absorber; sizing them for an average day means they are useless on the day
+you need them.
+
+### The topic split is the headline decision
+
+Six dispatch topics: `{sms, email, push} × {tx, bulk}`.
+
+Per-channel, because a stalled SMS record — a Twilio 429 with a 30-second backoff — head-of-line
+blocks every push and email record behind it in the same partition. One provider incident would
+degrade all three channels.
+
+`.tx` and `.bulk`, because a 10M-recipient blast puts ~11,000 records ahead of a password reset in
+every partition, which at 300 msg/s is a **37-second delay on a password reset**. Kafka partitions
+are strictly FIFO, so a priority *field* cannot fix this — only a physically separate topic can.
+
+And the mapping is computed by the domain enum, not by a switch in the messaging layer:
+
+```java
+public static String dispatchTopic(Channel channel, TrafficClass trafficClass) {
+    return trafficClass.dispatchTopic(channel);
+}
+```
+
+### Partition keys
+
+```java
+public static String forDispatch(long tenantId, UUID recipientId, Channel channel) {
+    return tenantId + "|" + recipientId + "|" + channel.name();
+}
+```
+
+The key decides three things at once: which partition, therefore what is ordered relative to what,
+therefore how evenly the work spreads. Getting it wrong produces no error — it produces a hot
+partition, which looks like "Kafka is slow".
+
+`recipientId` **must** be in the key. The published ordering contract is FIFO per
+`(tenantId, recipientId, channel)`, and that triple gives ~50M distinct keys:
+
+```
+mean = 100,000,000 / 72 = 1,388,889 records/partition
+sd   = sqrt(n · (1/p) · (1 − 1/p)) = 1,170
+4σ / mean = 0.337%                  ← statistically negligible
+```
+
+Key on `tenantId` alone and a mega-tenant at 40% of platform volume puts 40% of the traffic on one
+partition. **That is not a hashing problem and no partitioner fixes it — every real hot partition is
+a bug or an adversary.**
+
+Related bans the class exists to enforce: no time component in a key (it serialises the platform onto
+whichever partition owns "now"), and no custom partitioner (murmur2 stays, so key → partition is
+reproducible from outside the JVM during an incident).
+
+One key is deliberately *not* tenant-scoped:
+
+```java
+public static String forNotification(UUID notificationId) { return notificationId.toString(); }
+```
+
+The status projector's correctness depends on all observations for one notification — worker write,
+provider webhook, reconciler sweep — landing on the same partition, and `notification.status` is
+compacted, where the key *is* the identity of the compacted value.
+
+### Producer settings and the failure each prevents
+
+| Setting | Failure it prevents |
+|---|---|
+| `acks=all` | Acknowledged-then-lost on leader failover. `sms.tx` runs `minISR=3` because an OTP is worth more than the availability it costs |
+| `enable.idempotence=true` | Producer-side retries writing the record twice |
+| `max.in.flight=5` | Nothing on its own — it is safe *because* idempotence is on. Turn idempotence off and this same value silently breaks per-key ordering |
+| `retries=MAX_VALUE` + `delivery.timeout.ms=120000` | The retry *count* being the thing that gives up. A wall-clock deadline is the real bound |
+| `compression.type=zstd` | Paying bandwidth on highly repetitive JSON |
+| `linger.ms=25`, `batch.size=256 KB` | One-record batches. 25 ms is well inside the 5 s CRITICAL objective |
+| `buffer.memory=64 MB`, `max.block.ms=10000` | Broker client quotas throttle by **delay**, not by error — without buffer the latency surfaces as `BufferExhaustedException` instead of graceful degradation |
+
+Spring Boot's defaults are not these. `acks=1` loses acknowledged records when the leader dies before
+the followers catch up, and **that loss is silent** — the producer already returned success.
+
+The value serializer uses `.noTypeInfo()` deliberately: the subtype discriminator is in the payload
+as `eventType`, because Spring's header type id would put a Java FQCN on the wire and break every
+consumer the day a class moves.
+
+### Consumer settings — three that matter most
+
+**`enable.auto.commit=false`.** Auto-commit advances the offset on a timer that knows nothing about
+whether the database write succeeded. A pod evicted at the wrong moment is a notification Kafka
+believes was handled and PostgreSQL never saw — a loss with no error anywhere.
+
+**`max.poll.records=100`, not the default 500.** The dispatch consumer makes one network call per
+record. At 500 records and a provider degraded to 600 ms per call, one poll needs five minutes and
+blows through `max.poll.interval.ms`. Then: consumer evicted, group rebalances, backlog grows, every
+consumer pulls a full batch against a larger backlog, the hanging record is reassigned, repeat.
+**Throughput reaches zero while the Kafka cluster reports perfect health**, which is why teams debug
+the broker for hours.
+
+**`isolation.level=read_committed`.** The expander produces inside a Kafka transaction. Without this
+the dispatch consumers read aborted records and send messages for requests that were rolled back.
+
+Two more worth naming:
+
+```java
+public static final String DEFAULT_GROUP_PROTOCOL = "consumer";     // KIP-848, GA in Kafka 4.0
+```
+
+Assignment moves to the broker-side coordinator, which removes the group-wide synchronisation
+barrier — the thing that makes a rebalance stop *every* consumer in the group rather than just the
+ones losing partitions. Set to `classic` and the config installs `CooperativeStickyAssignor` instead;
+the two are mutually exclusive, because the new protocol rejects `partition.assignment.strategy`
+outright.
+
+```java
+var valueDeserializer = new ErrorHandlingDeserializer<>(delegate);
+```
+
+Without this wrapper a single unparseable record throws inside the poll loop, the container seeks
+back to it, and **the partition stops forever with no consumer error rate to alarm on.**
+
+`AckMode.MANUAL_IMMEDIATE`, not `MANUAL`: a batched acknowledgement lost to a pod eviction redelivers
+the whole poll — 100 duplicate provider calls instead of one.
+
+### The idempotent receiver
+
+```java
+if (!idempotentConsumer.isFirstSighting(GROUP, event.eventId())) {
+    ack.acknowledge();                 // already applied; commit and move on
+    return;
+}
+try {
+    apply(event);
+    ack.acknowledge();                 // offset committed AFTER the DB commit
+} catch (RuntimeException e) {
+    idempotentConsumer.forget(GROUP, event.eventId());   // let the redelivery through
+    throw e;
+}
+```
+
+Layer 2 of the five-layer idempotency stack. Two design choices:
+
+**The key is scoped by consumer group, not global.** Several groups read `notification.delivery` —
+the ledger writer, the status projector, the analytics tap — and each must apply the event exactly
+once. A global key would let whichever group polled first mark the event seen and silently starve
+every other group. *That failure produces no error, no lag and no alert.*
+
+**If Redis is down we process anyway.** Failing closed converts a cache outage into a total delivery
+outage. We are not undefended: layer 4 is a `UNIQUE (recipient_id, attempt_number)` constraint written
+*before* the provider call, and layer 5 is the provider idempotency token. This layer makes the common
+case cheap; it is not the only defence. `isFullyProtected()` reports the degraded mode rather than
+letting it be assumed.
+
+It is a plain helper rather than an annotation plus an aspect, because an aspect hides the two things
+a reader most needs to see: that the key is checked at all, and where `forget()` is called on failure.
+
+**Say:** *"288 partitions, and every number comes from measured consumer throughput, not bytes.
+The cluster only moves about 16 megabytes a second compressed — bytes are never the constraint.
+Sizing Kafka by MB/s gives you a cluster that's five times short on partitions."*
+
+---
+
+## Part 9 — The accept path and the outbox
+
+`platform-application/.../usecase/AcceptNotificationUseCase.java`
+
+Five steps, and the order is the design:
+
+```java
+// 1. Claim, before anything is charged or written.
+var claim = idempotencyStore.claim(tenantId, key, command.requestFingerprint());
+switch (claim.outcome()) {
+    case REPLAY      -> { return AcceptResult.replayed(stored.status(), stored.body()); }
+    case CONFLICT    -> throw new IdempotencyConflictException(key);
+    case IN_PROGRESS -> throw new RequestInProgressException(key);
+    case CLAIMED     -> { /* ours; carry on */ }
+}
+
+// 2. Quota, charged per recipient. Fail-open on an unavailable limiter.
+enforceQuota(tenantId, command.recipientCount());
+
+// 3. The single atomic accept decision.
+var records = acceptanceWriter.persist(command, requestId, acceptedAt, command.expiresAt(acceptedAt));
+
+// 4. Store the exact bytes we are about to return, so a retry replays them.
+idempotencyStore.complete(tenantId, key, ACCEPTED_STATUS, responseSerializer.serialize(result));
+
+// 5 (+ fast path). Post-commit, best-effort. The outbox sweeper is the guarantee.
+publishBestEffort(command, records);
+```
+
+**Step 3 is the accept decision.** `notification_request` + one `notification` per channel + one
+`outbox_message`, committed together. Before that commit, nothing happened and the client's retry is
+free; after it, the message will be delivered even if this pod dies in the next instruction. There is
+no in-between state to reconcile, which is the entire reason the API can be stateless and lose zero
+in-flight work on a rolling deploy.
+
+**`CONFLICT` is the check most implementations skip.** Same `Idempotency-Key`, *different* body must
+be a 409, never a silent replay of an unrelated response. Without the fingerprint, a client that
+reuses a key by accident gets someone else's answer.
+
+**Quota fails open.** A Valkey outage that reads as "every tenant is over quota" turns a degraded
+cache into a total outage of the send API.
+
+```java
+} catch (RuntimeException e) {
+    log.warn("quota check unavailable, admitting tenant={} permits={}", tenantId, permits, e);
+    return;
+}
+```
+
+**The Kafka publish is after the commit and is best-effort:**
+
+```java
+} catch (RuntimeException e) {
+    // The row and its outbox entry are already committed.
+    log.warn("fast-path publish failed for request={}, outbox sweeper will recover", …);
+}
+```
+
+It is a *latency optimisation*, not the hand-off. A broker outage costs the ~2 s the sweeper takes to
+notice, and nothing else. Letting the failure propagate would turn a committed accept into a 500, and
+the client's retry would then replay a response we never sent them.
+
+### What the accept path deliberately does *not* do
+
+Preference resolution, template rendering, business dedup and provider selection. Two reasons, both
+worth saying:
+
+1. Every one of them is a dependency that can be slow or down, and none of them should be able to
+   make `POST /notifications` fail.
+2. They are only *correct* at dispatch time. Quiet hours evaluated at accept time freeze an answer
+   for a send that happens next week; a template pinned now renders with the typo the tenant fixed
+   yesterday.
+
+### The claim is not released on failure
+
+If a later step throws, the idempotency claim is left `IN_PROGRESS` and expires with its lock. A
+retry gets `request-in-progress` and then a clean run. **Actively releasing it would mean writing to
+the idempotency store on the failure path — the path most likely to be failing.**
+
+### The outbox sweeper
+
+`app-scheduler/.../outbox/OutboxSweeper.java`
+
+This is the **safety net, not the delivery path**. In a healthy system it finds an empty table almost
+every tick. It exists for: the JVM dying between commit and publish, the broker unreachable for
+ninety seconds, a producer buffer filling.
+
+**A double publish is harmless and expected.** The fast path and the sweeper will sometimes both send
+the same record; that is the price of not making the API wait for an ack. Every consumer is an
+idempotent receiver keyed on `eventId`, and every status write goes through the monotonic guard.
+Designing to *avoid* the duplicate — a publish inside the transaction, a distributed transaction, a
+lock — costs far more than tolerating it.
+
+**Published rows are DELETEd, never UPDATEd.** Stamping `published_at` and leaving the row makes the
+table and its partial index grow without bound; at 100M/day the outbox becomes one of the largest
+tables in the database, holding data whose only purpose was to be forwarded. `published_at` exists for
+crash forensics, never as the normal terminal state.
+
+**The relay does not re-derive topic or key.** Both were decided and stored when the row was written.
+Recomputing them would let the fast path and the sweeper disagree after any refactor — and a
+disagreement means the same event on two topics, invisible until a consumer group reports zero lag on
+a topic nobody produces to any more.
+
+**Say:** *"The accept transaction is the whole contract. One commit: the request row, one notification
+per channel, and the outbox row. Before it nothing happened; after it, delivery is guaranteed even if
+the pod dies on the next instruction. The Kafka publish afterwards is a latency optimisation, and if
+it fails the sweeper picks it up in about two seconds."*
+
+---
+
+## Part 10 — The workers
+
+`app-worker/`
+
+### The eight-step dispatch sequence
+
+`AbstractChannelWorker` fixes it once so three channels cannot each get it slightly wrong:
+
+1. **Idempotent-receiver check** — Kafka is at-least-once; a rebalance mid-batch redelivers a record
+   whose effect was "send an SMS to a real phone".
+2. **Load the recipient row** — the event is a pointer to committed state, never the state itself.
+3. **Re-check eligibility** — cancelled or expired since the event was published. *A 40-minute-old
+   one-time passcode is worse than no passcode: the user has already asked for another one.*
+4. **Select a provider** from those whose circuit is not open. An open circuit removes a candidate;
+   it does not fail the send.
+5. **Write `delivery_attempt` as `PENDING` and commit it — before the network call.**
+6. **Call the provider through the decorator chain**, never the raw adapter.
+7. **Record the outcome, then publish a status event** — the row is the ledger, the event is the
+   notification about it.
+8. **On failure, classify and route** — decided in `RetryRouter` and nowhere else.
+
+**The offset is acknowledged only after all eight.**
+
+Step 5 is the one to talk about:
+
+```
+t0  INSERT delivery_attempt(state=PENDING, idempotency_token=T)  ← COMMITTED
+t1  provider.send(payload, T)
+t2  pod OOM-killed
+t3  redelivery → attempt found PENDING, response_at NULL, age > timeout
+    → UNKNOWN, do NOT blind-retry → reconcile
+```
+
+Committing `PENDING` *before* the network call converts an invisible failure into a visible,
+reconcilable one. Write the row afterwards and the crash is indistinguishable from never having sent,
+which forces a guess: retry and duplicate, or drop and lose.
+
+### The router filters, the strategy scores
+
+`ChannelProviderRouter` touches live state — circuit breakers, health probes, providers this message
+has already failed on. `HealthWeightedSelectionStrategy` is a **pure function of numbers**:
+
+```
+score = w1·successRate + w2·(1/normLatency) + w3·(1/normCost)
+      + w4·priorityBoost − w5·recentFailurePenalty
+
+Weights.defaults() = (0.45, 0.20, 0.10, 0.15, 0.30)
+```
+
+Latency and cost are normalised *against the candidate set*, so the best candidate on each axis
+scores 1.0. Absolute normalisation would need a tuned constant per channel — a 300 ms email and a
+300 ms SMS are not comparable — and that constant would be wrong the first time a vendor changed its
+infrastructure.
+
+`successRate` outweighs latency and cost combined, and cost is the smallest term on purpose: *a
+router that optimises the invoice ahead of delivery will find the cheapest way to not deliver a
+password reset.*
+
+**The runner-up gets a capped minority share:**
+
+```java
+public static final double MAX_EXPLORATION_SHARE = 0.25;
+```
+
+A router that sends 100% to the leader leaves the backup cold, and "cold" is not a metaphor: empty
+connection pool, aged-out DNS, gone TLS sessions, stale JIT profile, and — worst — a
+`successRate5m` that is a stale number from whenever it last saw traffic. The first request after a
+failover pays all of that at once, at the exact moment the primary has died. The cap stops the backup
+quietly becoming a second primary and doubling the bill.
+
+Cold start is handled explicitly:
+
+```java
+public static ProviderCandidate freshlyRegistered(NotificationProvider p, int priority, long cost) {
+    return new ProviderCandidate(p, priority, 1, cost, 0, 1.0, 0.0);   // successRate starts at 1.0
+}
+```
+
+Start a new provider at 0.0 and it scores last forever and never earns traffic — the deadlock that
+makes an operator disable the router and hard-code a vendor.
+
+Empty is a **normal return**, not an exception: every provider for a channel being down is an
+operational state (park on a retry tier and page), and push genuinely has one route to a device.
+
+### The registry makes "one class plus two config rows" true
+
+```java
+public ProviderRegistry(List<NotificationProvider> providers) { … }
+```
+
+Spring collects every `NotificationProvider` bean into the constructor. Adding a vendor is a new
+`@Bean` and nothing else — no registration call to forget, no enum to extend, no switch to update.
+
+Duplicate codes **fail the context start** with both bean names in the message. Two beans claiming
+`mock-sms-primary` would leave the router and the chaos endpoint each resolving to whichever one the
+map happened to keep, so a fault injected into "the" primary would land on a provider nobody is
+routing to, and the failover demo would appear to do nothing.
+
+A channel with one provider logs *"there is nothing to fail over to"*; a channel with none logs a
+warning. The silent version of that is every PUSH notification failing selection at 3am.
+
+### The monotonic status service
+
+`app-worker/.../status/MonotonicDeliveryStatusService.java`
+
+The guard itself is the one SQL statement from Part 2. What this class adds is three decisions:
+
+1. **Zero rows is not an error.** It means the event was stale, duplicated or illegal. The event is
+   recorded with `applied = false` and a counter incremented. Those rows are the most valuable
+   debugging artefact in the system — the only thing that can answer *"why is this stuck in SENT"*
+   with *"three later signals arrived and every one was correctly discarded"*.
+2. **The parent notification is advanced only through the dispatch ladder.** Applying a recipient's
+   terminal outcome to the parent would mark a 10M-recipient campaign DELIVERED the moment the first
+   phone buzzed.
+3. **The dedup pre-check races, and that is fine.** The unique index on `(dedup_hash, occurred_at)`
+   is the real defence; the pre-check keeps the common case out of the exception path.
+
+### Fan-out happens on the async side
+
+`RequestFanOut` is separated from `RequestedEventListener` for one reason: the transaction must have
+**committed** before anything is published to Kafka, and `@Transactional` on the listener method
+itself would commit only *after* the publish, inverting that order. A Kafka record referring to a row
+that does not exist yet is a dispatch worker that loads nothing, decides the message was cancelled,
+and drops it.
+
+Preferences are evaluated here, at dispatch. A campaign accepted at 09:00 and expanded at 14:00 has
+five hours in which the user can unsubscribe, and a suppression arriving in that window must win.
+
+> **Not built:** `PermissivePreferenceResolver` admits everything, `EchoTemplateRenderer` returns the
+> body unchanged, and `LoggingSuppressionWriter` logs rather than writing to `suppression_entry`. The
+> ports and the schema exist; the real implementations do not.
+
+**Say:** *"The step that matters is committing the attempt row as PENDING before the network call. If
+the pod dies mid-send, redelivery finds a PENDING row with a start time and knows 'we may have sent
+this'. Write the row afterwards and the crash is indistinguishable from never having sent, which
+forces you to guess — retry and duplicate, or drop and lose."*
+
+---
+
+## Part 11 — The scheduler's three tiers
+
+`app-scheduler/`
+
+Three stages, each with a different concurrency model, because they have different failure modes.
+
+### Tier 1 — the hydrator, leader-elected
+
+`DueScanHydrator` — **one** elected pod range-scans PostgreSQL for work due in the next five minutes
+and pushes it into per-shard Redis sorted sets.
+
+Why leader-elect the *scan* when `SKIP LOCKED` is the standard answer to concurrent queue consumers?
+Because `SKIP LOCKED` fixes correctness and serialisation without fixing **bloat**. A documented
+pgsql-general case hit a hard wall at **128 concurrent claimers on 80 cores**; the diagnosis was that
+each session must skip every dead or non-matching tuple left behind at the start of the table by all
+the other sessions. Wasted index visits scale as **B·W²/2** in batch size B and worker count W — so
+the intuitive fix, raising the batch size to do more per pass, *multiplies the quadratic term*. It is
+precisely the wrong lever.
+
+So the scan runs on one pod, from one session, as a plain read that produces no dead tuples at all.
+River and Oban both arrived at the same split.
+
+**Losing the leader is a delay, not a loss.** Rows stay READY in PostgreSQL until a claimer takes
+them, so a hydrator that dies mid-pass costs at most one scan interval.
+
+The leadership campaign is **inside the tick**, not on a separate renewal thread:
+
+```java
+var leadership = settings.leaderElection()
+        ? election.campaign(settings.leaseName(), settings.leaseDuration()).orElse(null)
+        : unelected;
+```
+
+A separate renewer keeps advertising a healthy leader while the scan thread is wedged on a hung
+query — the lease never expires and a replica that could make progress never gets the chance.
+Renewing only when a pass actually starts makes a stuck hydrator lose the lease, which is the
+behaviour that heals.
+
+And it is **fenced**:
+
+```java
+if (result == DueIndex.FENCED_OUT) {
+    // We paused past our lease and a new leader has already written this shard.
+    election.resign(settings.leaseName());
+    leading = false;
+    return;
+}
+```
+
+A monotonic fencing token, checked on every shard write. A GC pause longer than the lease is not
+hypothetical, and the alternative is two hydrators writing the same horizon.
+
+### Jitter is applied to the Redis score only
+
+```java
+private static long scoreOf(ScheduledWork work) {
+    if (work.trafficClass() == TrafficClass.CRITICAL) return work.dueAt().toEpochMilli();
+    return ScheduleJitter.apply(work.id(), work.dueAt()).toEpochMilli();
+}
+```
+
+Humans schedule on the hour — not approximately; a campaign UI with a 15-minute picker guarantees it.
+
+```
+25,000,000 × 5% = 1,250,000 in 60 s  =  20,833 dispatches/s
+spread over 300 s                    =   4,167 dispatches/s
+```
+
+20,833/s is five times the platform's steady-state ceiling. 4,167/s is ordinary traffic. **The
+difference costs one modulo.**
+
+Two details:
+
+- **The database row is never updated.** `due_at` feeds the immutable partition key, and moving it is
+  a cross-partition row move at triple the WAL cost. Spreading in the index is free.
+- **Deterministic, hashed from the row's own id.** A random offset would move on every restart, so a
+  hydrator that crashes and re-scans the same rows pushes different scores, a row can be dispatched
+  twice at two different instants, and no two load-test runs agree. Hashing means hydration is
+  idempotent and a support question — *"why did this land at 09:03:47?"* — has an answer that can be
+  recomputed by hand.
+- **CRITICAL is exempt.** Its dispatch objective is five seconds; five minutes of deliberate spread
+  would breach it by two orders of magnitude to solve a herd problem that lane does not have.
+
+### Tier 2 — shard-affine claimers
+
+`ShardAffineClaimer` takes due work off *this pod's own shards*, leases it, and publishes it.
+
+```
+16 concurrent claimers, 3M READY rows, 100 rows per transaction:
+
+FOR UPDATE (stampede)        159 tps    15,900 rows/s   100.5 ms avg
+FOR UPDATE SKIP LOCKED       453 tps    45,300 rows/s    35.3 ms avg
+shard-affine + SKIP LOCKED   746 tps    74,600 rows/s    21.5 ms avg
+```
+
+The naive version raises **no errors at all**. It serialises, because all sixteen pods walk the same
+index in the same order, and the symptom presents as "the database is slow" — which is why the
+instinct is to add claimers, and why adding claimers makes it worse.
+
+With affinity, two pods do not reach for the same row, so `SKIP LOCKED` has almost nothing to skip; it
+earns its place only during a rebalance window, and that narrow role is the whole 746-versus-453 gap.
+
+**The transaction never spans the network call.** Claim commits, then the publish happens, then a
+second short transaction records the outcome. Holding the claim transaction open across a 10-second
+Kafka timeout would pin `xmin`, and a pinned `xmin` stops autovacuum reclaiming the twenty million
+dead tuples a day that status updates generate. *That is the failure that takes the cluster down at
+3 a.m., and it always starts as a convenience.*
+
+**A failed publish is a no-op, never a partial state.** The row stays CLAIMED, its lease expires, and
+`LeaseReaper` returns it to READY. There is no compensating write to get wrong.
+
+### Tier 3 — the sweepers
+
+| Job | What it covers |
+|---|---|
+| `OutboxSweeper` | Accepted-but-unpublished rows (Part 9) |
+| `LeaseReaper` | CLAIMED rows whose lease expired — a claimer that died mid-flight |
+| `RetryPromoter` | Retries the Kafka tiers lost |
+| `PartitionMaintenanceJob` | Creating tomorrow's partitions before anything needs them |
+
+`RetryPromoter` is the interesting one. Retrying is *not* its job — the tiers do that. It covers the
+gap the tiers cannot: a topic that lost records inside the retention window, a consumer group whose
+offsets were reset past the parked messages, a worker deployment down long enough for a tier's records
+to age out, a `next_attempt_at` written by a worker that died before producing the retry event. In
+every one of those cases the row in PostgreSQL is the **only remaining evidence** that a retry was
+owed.
+
+**The grace period is what stops it being a duplicate generator.** Rows are only touched once they are
+`grace` past due; sweeping at `next_attempt_at` exactly would race the tier consumer on every ordinary
+retry in the platform.
+
+In a healthy system this sweep finds nothing. That is the point, and it is also why the per-row lookup
+of the parent notification is acceptable here and would not be on the claim path.
+
+**Say:** *"Three tiers with three different concurrency models. The scan is leader-elected because
+SKIP LOCKED fixes correctness but not bloat — wasted index visits go as W², so adding workers makes it
+quadratically worse. The claim is shard-affine plus SKIP LOCKED, and I measured it: 746 transactions a
+second against 159 for the naive form."*
+
+---
+
+## Part 12 — The API layer
+
+`app-api/`
+
+> **Honest note:** `app-api` compiles and its 29 tests pass, but **it cannot boot today.** Its three
+> inbound ports — `NotificationCommandPort`, `NotificationQueryPort`, `WebhookIngestPort` — have no
+> implementations anywhere in the reactor, so a real context start fails with
+> `UnsatisfiedDependencyException`. The controllers, DTOs, error handling, interceptors and webhook
+> verifier are all real and tested against mocked ports. See [STATUS.md](STATUS.md).
+
+### The controller is thin on purpose
+
+```java
+public ResponseEntity<AcceptResponse> send(ApiCaller caller,
+                                           @Valid @RequestBody SendNotificationRequest request,
+                                           HttpServletRequest servletRequest) {
+    var idempotencyKey = (String) servletRequest.getAttribute(IdempotencyKeyInterceptor.ATTRIBUTE);
+    request.scheduleOrImmediate().resolveSendAt(clock.instant());
+    var accepted = commands.accept(caller, idempotencyKey, request);
+    return ResponseEntity.accepted()
+            .location(URI.create("/v1/notifications/" + accepted.notificationRequestId()))
+            .body(accepted);
+}
+```
+
+It validates transport-shaped things — the idempotency header, the page size, the id format — and
+delegates every decision with a business consequence to a port. **The reason is atomicity of the
+accept transaction:** anything the controller does between claiming the key and writing the rows is
+outside that transaction. A controller that "just" writes an audit row before calling the service has
+already broken the property that makes a client retry safe.
+
+Schedule resolution is deliberately at the edge, *before* the port call: an unzoned or past `sendAt`
+is a 400 the caller must fix, and discovering it after the idempotency key has been claimed would
+burn the key and make the caller's corrected retry a 409.
+
+**202, not 200, and not 201.** 200 would claim delivery happened. 201 would claim a single resource
+was created, and this creates one per channel plus a request envelope. 202 is the only code that says
+what is true.
+
+**Cancel needs no idempotency key.** `CANCELLED` is terminal, so a repeated cancel of an
+already-cancelled notification is a no-op, and a repeated cancel of a dispatched one is the same 409
+either time. Demanding a key adds a failure mode — a client retrying a cancel with a fresh key — in
+exchange for nothing.
+
+**`limit` is validated, not clamped.** A caller asking for 5,000 has a bug worth correcting; quietly
+returning 200 of them teaches them the request worked, so their reconciliation loop misses 96% of the
+recipients and nobody finds out until a campaign is audited.
+
+### RFC 9457 problem details
+
+`ProblemType` is a **closed enum** of every machine-readable error identifier the API can emit:
+
+```java
+VALIDATION_FAILED       ("validation-failed",        400)
+SCHEDULE_INVALID        ("schedule-invalid",         400)
+UNAUTHENTICATED         ("unauthenticated",          401)
+INSUFFICIENT_SCOPE      ("insufficient-scope",       403)
+NOTIFICATION_NOT_FOUND  ("notification-not-found",   404)
+IDEMPOTENCY_KEY_REUSED  ("idempotency-key-reused",   409)
+REQUEST_IN_PROGRESS     ("request-in-progress",      409)
+ALREADY_DISPATCHED      ("already-dispatched",       409)
+PAYLOAD_TOO_LARGE       ("payload-too-large",        413)
+ALL_RECIPIENTS_SUPPRESSED("all-recipients-suppressed",422)
+RATE_LIMITED            ("rate-limited",             429)
+INTERNAL_ERROR          ("internal-error",           500)
+SERVICE_DEGRADED        ("service-degraded",         503)
+```
+
+Without a stable `type` URI, a caller who needs to distinguish "your schedule was invalid" from "your
+idempotency key was reused" has exactly one tool — `detail.contains("idempotency")` — and the day
+someone improves the wording, their retry logic silently changes behaviour.
+
+**Two 400s and three 409s exist deliberately.** The status code is not specific enough to act on,
+which is the entire argument for RFC 9457.
+
+`NOTIFICATION_NOT_FOUND` is also the answer for a **cross-tenant read**. A 403 confirms the resource
+exists, which is an information leak; the integration test asserts 404.
+
+> Spring 7 note: `HttpStatus.PAYLOAD_TOO_LARGE` and `UNPROCESSABLE_ENTITY` are deprecated in favour of
+> `CONTENT_TOO_LARGE` and `UNPROCESSABLE_CONTENT`. Same codes, 413 and 422.
+
+### Webhook verification — four gates
+
+```java
+var expected  = hmac(provider.secret(), timestampHeader, rawBody);
+var presented = decodeHex(stripPrefix(signatureHeader));
+if (presented == null || !MessageDigest.isEqual(expected, presented)) {
+    throw reject(providerCode, Reason.SIGNATURE_MISMATCH);
+}
+```
+
+1. HMAC-SHA256 over `timestamp + "." + rawBody`, compared in **constant time**
+2. Timestamp inside the replay window, **both directions**
+3. Source IP on the provider's allowlist
+4. `dedup_hash` UNIQUE insert — enforced by the database, not here
+
+**Why `MessageDigest.isEqual` and never `String.equals`.** `equals` returns as soon as two characters
+differ, so the time it takes is a function of how many leading characters were correct — and that
+difference is measurable across a network given enough samples. An attacker who can post repeatedly
+recovers a valid signature one hex character at a time: sixty-four rounds of a few thousand requests
+each, no secret required.
+
+The comparison is on decoded **bytes**, not hex strings, for the same reason: a length check on the
+string would short-circuit and leak the expected length.
+
+**Why the timestamp is signed.** Signing the body alone makes every captured payload valid forever.
+Binding the timestamp into the MAC means changing it invalidates the signature, and keeping the
+original fails gate two. A future timestamp is rejected too — that is not "harmless clock skew", it is
+how a captured payload is made valid for longer than the window allows.
+
+**The separator is not decoration:**
+
+```java
+mac.update(timestamp.getBytes(UTF_8));
+mac.update((byte) '.');
+mac.update(rawBody);
+```
+
+Without it, `(ts="1", body="23")` and `(ts="12", body="3")` produce the same MAC input.
+
+**The raw bytes are signed, never a re-serialised object.** Re-serialising a parsed body changes key
+order and whitespace and breaks every signature.
+
+**Say:** *"Constant-time comparison isn't paranoia here — `String.equals` short-circuits on the first
+differing character, and that timing difference is measurable across a network. You recover a valid
+HMAC one hex digit at a time in sixty-four rounds. And I sign the timestamp along with the body,
+because signing the body alone makes every captured payload valid forever."*
+
+---
+
+## Part 13 — Observability that actually pages
+
+`docker/prometheus/rules/notification-slo.yml` · `docker/grafana/dashboards/notification-operational.json`
+
+Two principles, both visible in the rule file.
+
+**An SLO you cannot compute is a slogan.** Every SLI in §1.4 of the spec has a recording rule named
+after it — `sli:api_availability:error_ratio_5m`, `sli:dispatch_latency:p99_5m`,
+`sli:scheduler_lag:bad_ratio_30m` — so "what is our accept latency" has one answer rather than one per
+dashboard.
+
+Availability is recorded as the **error** ratio, not the success ratio. Burn-rate maths is expressed
+in error budget consumed, and `(1 - success)` loses float precision exactly where the numbers are
+small and it matters.
+
+**Alert on burn rate and on conjunctions, never on a raw threshold and never on lag alone.** Lag alone
+is equally consistent with a poison pill, a stuck poll, a provider outage and a healthy catch-up after
+a deploy. Each needs a different response, so a single `lag > N` alert trains the on-call to ignore it.
+The rule file therefore has `KafkaPoisonPillSuspected` (lag rising **and** commit rate flat),
+`KafkaStuckPoll`, `KafkaRebalanceStorm` and `MetastableFailureSuspected` as separate conjunctions.
+
+One more detail that is easy to miss: **NaN is load-bearing.** With zero traffic every ratio is 0/0 =
+NaN, and every comparison against NaN is false — so an idle laptop does not page.
+
+The dashboard pairs the two panels that must be read together: *"Consumer lag by group — read WITH the
+commit rate below, never alone"* and *"Consumer commit rate — flat zero here with rising lag above is a
+poison pill."*
+
+Full catalogue: [OBSERVABILITY.md](OBSERVABILITY.md).
+
+---
+
+## Where to go next
+
+| Question | Document |
+|---|---|
+| What is actually finished? | [STATUS.md](STATUS.md) |
+| How do I narrate this in an interview? | [INTERVIEW-GUIDE.md](INTERVIEW-GUIDE.md) §12 |
+| Why was each decision made? | [adr/](adr/) — 18 records |
+| What breaks first at 10× the load? | [SCALABILITY.md](SCALABILITY.md) |
+| What happens when Kafka dies? | [FAILURE-MODES.md](FAILURE-MODES.md) |
+| How do I add a real vendor? | [ADDING-A-PROVIDER.md](ADDING-A-PROVIDER.md) |

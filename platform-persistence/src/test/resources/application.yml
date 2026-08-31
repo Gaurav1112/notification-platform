@@ -1,0 +1,27 @@
+# Test-only configuration. The applications configure Flyway themselves; in production the
+# migration runs as a Kubernetes Job *before* the rolling deploy, never at application startup —
+# N pods racing Flyway's advisory lock alongside CREATE INDEX CONCURRENTLY is a documented
+# indefinite hang. Here there is exactly one JVM and no concurrent index build, so running it on
+# context startup is safe and keeps the tests self-contained.
+spring:
+  flyway:
+    enabled: true
+    schemas: notif
+    locations: classpath:db/migration
+  jpa:
+    open-in-view: false
+    hibernate:
+      # validate, never create. Letting Hibernate generate the DDL would produce unpartitioned
+      # tables and every partitioning test would pass against the wrong shape. Validating instead
+      # turns the whole test run into a check that all 13 entity mappings still match the real
+      # migrated schema, which is the mistake most likely to be made when a column is added.
+      ddl-auto: validate
+    properties:
+      hibernate.jdbc.batch_size: 50
+      hibernate.order_inserts: true
+      hibernate.order_updates: true
+
+logging:
+  level:
+    org.testcontainers: warn
+    com.github.dockerjava: warn

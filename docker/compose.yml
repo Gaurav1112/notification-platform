@@ -1,0 +1,317 @@
+# =============================================================================
+# Local runtime for the notification platform.
+#
+# This is the LOCAL stack only. Production runs the same logical topology on
+# managed services (spec §11):
+#
+#   kafka      -> Amazon MSK, 6 x kafka.m7g.xlarge, 3 AZ, KRaft, IAM + TLS
+#   postgres   -> RDS PostgreSQL 18.6, db.r7g.8xlarge Multi-AZ + 2 replicas
+#   valkey     -> ElastiCache (Valkey 9), cluster mode on, 3 shards + replicas
+#   prometheus -> Amazon Managed Prometheus (AMP) via an OTel Collector
+#   grafana    -> Amazon Managed Grafana (AMG)
+#
+# Everything here is deliberately single-node and RF=1. The numbers that matter
+# in production -- RF 3, min.insync.replicas 2 (3 on sms.tx), 288 partitions --
+# cannot be expressed on one broker, so the local topics use the production
+# partition *ratios* divided by 6 (see docker/kafka/create-topics.sh). Ratios
+# are what surface partition-skew and ordering bugs; absolute counts are not.
+#
+# The three Spring applications run on the HOST (./mvnw spring-boot:run), not in
+# containers, so that a reviewer can attach a debugger and hot-reload. That is
+# why Prometheus scrapes host.docker.internal and why Kafka advertises two
+# listeners: `localhost:9092` for the host JVMs and `kafka:19092` for kafka-ui.
+# Getting that wrong is the single most common local-Kafka failure -- the client
+# bootstraps fine and then times out talking to an unresolvable advertised host.
+#
+#   docker compose -f docker/compose.yml up -d      (or: make up)
+# =============================================================================
+
+name: notification-platform
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 18.6 -- the system of record.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:18.6
+    container_name: np-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: notification
+      POSTGRES_USER: notification
+      POSTGRES_PASSWORD: notification
+      # C collation + UTF8: index order must not depend on the host's glibc
+      # version. A glibc upgrade under a locale-collated index silently
+      # corrupts range scans, and the failure looks like "row exists but the
+      # query cannot find it".
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale-provider=builtin --builtin-locale=C.UTF-8"
+    command:
+      - postgres
+      # 200 connections because three apps x HikariCP defaults plus psql plus
+      # Testcontainers overruns the stock 100 and the failure surfaces as a
+      # confusing "FATAL: sorry, too many clients" during a demo.
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=512MB
+      # logical, so the RUNBOOK's replication-slot procedure is reproducible
+      # locally rather than being theory.
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=8
+      - -c
+      - max_wal_senders=8
+      # Surface the queries that would page us in production.
+      - -c
+      - log_min_duration_statement=500
+      - -c
+      - log_lock_waits=on
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      # -U/-d are required: pg_isready without them reports the server up while
+      # the bootstrap database is still being created by initdb.
+      test: ["CMD-SHELL", "pg_isready -U notification -d notification"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Valkey 9 -- idempotency cache, quota counters, shared circuit state,
+  # frequency-cap bitmaps. Never the system of record: every read here has a
+  # Postgres fallback (spec §9), so losing this container degrades quality,
+  # not correctness.
+  # ---------------------------------------------------------------------------
+  valkey:
+    image: valkey/valkey:9.1.1
+    container_name: np-valkey
+    ports:
+      - "6379:6379"
+    command:
+      - valkey-server
+      - --appendonly
+      - "yes"
+      # noeviction, deliberately. An LRU policy would silently evict
+      # idempotency keys under memory pressure and turn a cache miss into a
+      # duplicate SMS. We would rather see OOM errors and fail open explicitly.
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - valkey-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Kafka 4.3.1, KRaft single-node (ZooKeeper was removed in 4.0).
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:4.3.1
+    container_name: np-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      # A FIXED cluster id, not a generated one. Regenerating it on every `up`
+      # orphans the volume: the broker refuses to start with
+      # "The Cluster ID ... doesn't match stored clusterId".
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      # Three listeners on purpose:
+      #   CONTROLLER -- the KRaft quorum, never advertised to clients
+      #   INTERNAL   -- container-to-container (kafka-ui, kafka-init)
+      #   EXTERNAL   -- the host JVMs, advertised as localhost:9092
+      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:9093,INTERNAL://0.0.0.0:19092,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:19092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+
+      # RF=1 across every internal topic. The stock defaults are 3 and a
+      # single-node broker cannot satisfy them, so the coordinator never
+      # initialises and every consumer hangs on group join.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+
+      # KIP-848. The apps set group.protocol=consumer; if the broker does not
+      # offer the new protocol the client silently falls back to `classic` and
+      # the rebalance-storm mitigation we rely on (spec §22.7) is not actually
+      # under test locally.
+      KAFKA_GROUP_COORDINATOR_REBALANCE_PROTOCOLS: classic,consumer
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # Mirrors production. Auto-creation would paper over a topic-name typo
+      # with a 1-partition topic that behaves correctly until load arrives.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: 1
+
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_LOG_RETENTION_HOURS: 72
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx1g"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      # Talks the real protocol over the INTERNAL listener. A TCP port check
+      # would go green while the broker is still replaying the metadata log,
+      # and dependent services would then fail their first admin call.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # One-shot topic creation. Runs to completion and exits 0; `up` is therefore
+  # self-sufficient -- no "why is everything failing" because someone skipped
+  # `make topics`. auto.create.topics.enable is off, so this is not optional.
+  # ---------------------------------------------------------------------------
+  kafka-init:
+    image: apache/kafka:4.3.1
+    container_name: np-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/scripts/create-topics.sh"]
+    environment:
+      BOOTSTRAP: kafka:19092
+    volumes:
+      - ./kafka:/scripts:ro
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # kafbat/kafka-ui -- the maintainer-led fork.
+  #
+  # NOT provectuslabs/kafka-ui: that project's last commit was 2024-07-26 and it
+  # carries an unpatched RCE history. An abandoned admin console with cluster
+  # credentials is not a convenience, it is an attack surface.
+  # ---------------------------------------------------------------------------
+  kafka-ui:
+    image: kafbat/kafka-ui:v1.5.0
+    container_name: np-kafka-ui
+    ports:
+      - "8081:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      # Gate the UI on topic creation, which also makes `up --wait` wait for it:
+      # kafka-init is a one-shot with no healthcheck, so `--wait` alone returns
+      # before the topics exist and `make up` would print a lie.
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
+      DYNAMIC_CONFIG_ENABLED: "true"
+      SERVER_SERVLET_CONTEXT_PATH: /
+      JAVA_OPTS: "-Xms256m -Xmx512m"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health | grep -q UP"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 45s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Prometheus 3.x. Scrapes the three host JVMs plus itself.
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    container_name: np-prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    extra_hosts:
+      # The apps run on the host, not on this network, so Prometheus reaches
+      # them through `host.docker.internal`.
+      #
+      # Do NOT hardcode `host.docker.internal:host-gateway` here. Docker
+      # Desktop, Rancher Desktop and Podman all provide that name natively and
+      # pinning it to host-gateway maps it to the VM's bridge (172.17.0.1)
+      # instead of the real host — every scrape then fails with "connection
+      # refused" and, because a down target makes every burn-rate rule
+      # evaluate to NaN, the alerting is silently disarmed rather than noisy.
+      #
+      # Native Linux Docker Engine is the one case where the name does not
+      # exist. There, and only there:
+      #   HOST_ALIAS='host.docker.internal:host-gateway' docker compose up -d
+      - "${HOST_ALIAS:-np-host-gateway:host-gateway}"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/healthy >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Grafana. Anonymous Admin -- LOCAL ONLY.
+  #
+  # This is safe here because the container is bound to the loopback stack and
+  # holds no credentials. The same setting in production would be an unauthenticated
+  # admin console; AMG uses IAM Identity Center instead.
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:13.1.4
+    container_name: np-grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_AUTH_BASIC_ENABLED: "false"
+      GF_USERS_DEFAULT_THEME: dark
+      GF_FEATURE_TOGGLES_ENABLE: traceToMetrics
+      GF_INSTALL_PLUGINS: ""
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health | grep -q ok"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  valkey-data:
+  kafka-data:
+  prometheus-data:
+  grafana-data:

@@ -1,0 +1,473 @@
+# =============================================================================
+# app-api — the synchronous accept path.
+#
+# Budget for POST /v1/notifications is p99 < 250 ms (spec §1.4), and everything
+# in this file that looks aggressive exists to defend that number: short
+# connection timeouts, a bounded pool, no open-session-in-view, and a Kafka
+# producer whose delivery timeout is far below the request timeout so a broker
+# problem degrades into "outbox sweeper will handle it" instead of a hung
+# thread.
+#
+# Every value is overridable by environment variable so the same jar runs in
+# EKS unchanged. Defaults point at docker/compose.yml.
+# =============================================================================
+
+spring:
+  application:
+    name: notification-api
+
+  # Running `./mvnw spring-boot:run` with no arguments must produce a working
+  # local app. Anything requiring a remembered -Dspring.profiles.active flag is
+  # a setup step half the reviewers will skip.
+  profiles:
+    default: local
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:notification}
+    username: ${DB_USER:notification}
+    password: ${DB_PASSWORD:notification}
+    hikari:
+      pool-name: np-api-pool
+      maximum-pool-size: ${DB_POOL_MAX:20}
+      minimum-idle: 5
+      # 3 s, not the 30 s default. A request that waits 30 s for a connection
+      # has already blown the 250 ms budget twelve times over; failing fast
+      # turns pool exhaustion into a 503 the caller can retry rather than a
+      # thread-pool pile-up that takes the pod down.
+      connection-timeout: 3000
+      validation-timeout: 2000
+      max-lifetime: 900000
+      leak-detection-threshold: 10000
+
+  jpa:
+    # Never true. open-in-view holds a connection for the whole request
+    # including JSON serialisation, which silently couples pool size to
+    # response size.
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 100
+          time_zone: UTC
+        order_inserts: true
+        order_updates: true
+        query:
+          in_clause_parameter_padding: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    schemas: notif
+    default-schema: notif
+    baseline-on-migrate: false
+    # The API owns migration locally so there is exactly one writer. In
+    # production this is a pre-deploy Job (spec §11), not an application
+    # concern — three pods racing the same baseline is a lock timeout, not a
+    # migration.
+    validate-on-migrate: true
+    clean-disabled: true
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      # 200 ms. Valkey is a latency optimisation, not the system of record —
+      # idempotency falls back to Postgres and quota fails open. Waiting a
+      # full second for a cache is strictly worse than missing it.
+      timeout: 200ms
+      connect-timeout: 200ms
+      lettuce:
+        # Unpooled. A Lettuce connection is thread-safe and multiplexes, so a
+        # pool only buys anything for blocking commands (BLPOP), transactions
+        # and pipelining — none of which are on the accept path.
+        #
+        # Flipping this to `true` ALSO requires org.apache.commons:commons-pool2
+        # on the classpath. Spring Boot 4 no longer degrades gracefully when it
+        # is absent: the context fails with NoClassDefFoundError on
+        # GenericObjectPoolConfig, from a stack trace that names the health
+        # endpoint rather than the pool. The dependency belongs in
+        # platform-resilience/pom.xml, which is not this module's to edit.
+        pool:
+          enabled: false
+        shutdown-timeout: 200ms
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    producer:
+      acks: all
+      retries: 2147483647
+      batch-size: 262144
+      compression-type: zstd
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        # Idempotent producer re-sequences on retry, which is what makes
+        # max.in.flight=5 safe. Without it, a retried batch can land behind a
+        # later one and per-key ordering breaks invisibly.
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5
+        # 10 s here, NOT the 120 s used by the worker. On the accept path the
+        # Kafka produce is a fast-path optimisation: if it does not complete
+        # quickly we let the outbox sweeper carry the message and return 202
+        # on time. The row is already committed, so nothing is lost.
+        delivery.timeout.ms: 10000
+        request.timeout.ms: 5000
+        linger.ms: 25
+    consumer:
+      group-id: notification-api
+      enable-auto-commit: false
+      auto-offset-reset: earliest
+      isolation-level: read-committed
+      max-poll-records: 100
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        # KIP-848, GA in Kafka 4.0. Assignment moves to the broker-side
+        # coordinator, removing the group-wide synchronisation barrier that
+        # turns a slow consumer into a rebalance storm.
+        group.protocol: consumer
+        max.poll.interval.ms: 300000
+        spring.json.trusted.packages: dev.gaurav.notification.*
+    listener:
+      ack-mode: manual
+      observation-enabled: true
+
+  threads:
+    virtual:
+      # The accept path is I/O bound on Postgres and Kafka. Platform threads
+      # would make pool size the ceiling on concurrency instead of the database.
+      enabled: true
+
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+  error:
+    # RFC 9457 problem+json is produced explicitly by the controller advice
+    # (spec §14). Boot's default whitelabel body must never leak out alongside it.
+    whitelabel:
+      enabled: false
+  tomcat:
+    threads:
+      max: 200
+    max-connections: 8192
+    accept-count: 200
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  health:
+    # Liveness deliberately does NOT include Postgres or Kafka (spec §11). A
+    # database blip must degrade the service, not trigger a cluster-wide
+    # restart storm that guarantees the outage.
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+  metrics:
+    tags:
+      application: notification-api
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        notification.dispatch.latency: true
+      # SLO buckets, not percentiles. The recording rules in
+      # docker/prometheus/rules/notification-slo.yml count events under a
+      # boundary (le="0.25"), because a burn rate needs a good/bad event ratio
+      # and quantiles cannot be aggregated across windows or instances.
+      slo:
+        http.server.requests: 50ms,100ms,250ms,500ms,1s,2s
+        notification.dispatch.latency: 1s,5s,30s,120s
+      minimum-expected-value:
+        http.server.requests: 1ms
+      maximum-expected-value:
+        http.server.requests: 10s
+  observations:
+    key-values:
+      deployment: local
+  tracing:
+    sampling:
+      # 1.0 locally. Production samples 100% of errors and CRITICAL, 1% of
+      # BULK — that decision is made by a sampler bean, not by this property.
+      probability: 1.0
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+    version: openapi_3_1
+  swagger-ui:
+    path: /swagger-ui.html
+
+# =============================================================================
+# Mock provider layer (spec §15, ADR-005).
+#
+# Only the LEAF adapter is mocked. The SPI, all six decorators, registry,
+# selection scoring, circuit breaker, rate limiter, failure classification,
+# retry tiers, DLQ, webhook receiver and state machine are the real code.
+#
+# The mocks emulate vendor SEMANTICS, not generic success. A mock that always
+# returns 200 proves the happy path and nothing else -- and the happy path is
+# not where notification platforms fail.
+#
+# Keys under `notification.providers.mock` bind to MockProviderProperties.
+# Latency is given as (median, p99) because those are the two numbers a vendor
+# SLA actually quotes; FailureInjector solves the log-normal parameters from
+# them. Log-normal and not uniform, because real provider latency is
+# long-tailed and a uniform distribution never produces the tail that trips a
+# p99 circuit breaker -- a breaker tuned against uniform latency is untested.
+# =============================================================================
+notification:
+  providers:
+    mock:
+      enabled: true
+
+      # Seeded RNG. Deterministic failure injection is what lets a CI job
+      # assert "exactly 3 messages reached the DLQ" instead of "some messages
+      # probably failed", which is not a test. Move this number and every
+      # failure in the suite changes.
+      seed: ${MOCK_SEED:20260831}
+
+      providers:
+
+        # --- SMS: Twilio semantics -------------------------------------------
+        # Twilio offers NO client-side idempotency key, which is what forces
+        # the UNKNOWN path to be real rather than theoretical. SILENT_SUCCESS
+        # carries a heavy weight here for the same reason: the mock ACKs after
+        # our timeout and fires the webhook anyway, and that is the only honest
+        # way to produce AttemptState.UNKNOWN.
+        # Failure codes emulated: 21610 STOP, 21614 not-a-mobile,
+        # 20429 too-many-requests, 30003 unreachable handset.
+        mock-sms-primary:
+          success-rate: 0.965
+          latency:
+            median: 250ms
+            p99: 2500ms
+          failures:
+            - { profile: TRANSIENT_NETWORK,   weight: 28 }
+            - { profile: PROVIDER_5XX,        weight: 18 }
+            - { profile: RATE_LIMITED,        weight: 20 }   # 20429
+            - { profile: INVALID_RECIPIENT,   weight: 12 }   # 21614
+            - { profile: UNSUBSCRIBED,        weight: 8 }    # 21610
+            - { profile: DEVICE_UNREGISTERED, weight: 4 }    # 30003
+            - { profile: SILENT_SUCCESS,      weight: 10 }
+
+        # The failover target. Deliberately healthier and slower: a secondary
+        # that is equally unreliable proves nothing about failover, and one
+        # that is equally fast hides the cost of failing over.
+        mock-sms-secondary:
+          success-rate: 0.985
+          latency:
+            median: 400ms
+            p99: 3500ms
+          failures:
+            - { profile: TRANSIENT_NETWORK, weight: 50 }
+            - { profile: PROVIDER_5XX,      weight: 30 }
+            - { profile: SILENT_SUCCESS,    weight: 20 }
+
+        # --- EMAIL: Amazon SES semantics --------------------------------------
+        # 50-destination bulk with per-destination results, `Throttling`,
+        # Permanent/General bounces and the complaint feedback loop. Bounces
+        # and complaints are ASYNCHRONOUS (SNS), not send-time results, so they
+        # arrive minutes later and must still reach the suppression list --
+        # otherwise sender reputation degrades and every tenant pays for it.
+        mock-email-primary:
+          success-rate: 0.99
+          latency:
+            median: 150ms
+            p99: 1200ms
+          failures:
+            - { profile: TRANSIENT_NETWORK, weight: 30 }
+            - { profile: RATE_LIMITED,      weight: 30 }   # Throttling
+            - { profile: CONTENT_REJECTED,  weight: 15 }   # MessageRejected
+            - { profile: INVALID_RECIPIENT, weight: 12 }
+            - { profile: UNSUBSCRIBED,      weight: 8 }
+            - { profile: QUOTA_EXCEEDED,    weight: 3 }    # AccountSendingPaused
+            - { profile: SILENT_SUCCESS,    weight: 2 }
+
+        mock-email-secondary:
+          success-rate: 0.995
+          latency:
+            median: 220ms
+            p99: 1800ms
+          failures:
+            - { profile: TRANSIENT_NETWORK, weight: 60 }
+            - { profile: RATE_LIMITED,      weight: 30 }
+            - { profile: SILENT_SUCCESS,    weight: 10 }
+
+        # --- PUSH: FCM v1 + APNs semantics ------------------------------------
+        # DEVICE_UNREGISTERED dominates on purpose: dead tokens are the normal
+        # steady state of a push channel, not an incident, and the 410 response
+        # carries the timestamp at which the token went invalid -- without it
+        # you cannot tell a genuinely dead token from one replaced after this
+        # message was queued.
+        #
+        # There is NO batch endpoint. FCM's /batch was deprecated 2023-06-21
+        # and stopped working 2024-06-21; sendEachForMulticast fans out to
+        # individual HTTP/2 requests and 500 is a client-side chunking limit,
+        # not a server batch. The mock reproduces one request per token so
+        # connection-pool sizing is exercised honestly.
+        mock-push-primary:
+          success-rate: 0.96
+          latency:
+            median: 200ms
+            p99: 1600ms
+          failures:
+            - { profile: DEVICE_UNREGISTERED, weight: 45 }  # UNREGISTERED / 404
+            - { profile: TRANSIENT_NETWORK,   weight: 20 }
+            - { profile: RATE_LIMITED,        weight: 15 }  # QUOTA_EXCEEDED / 429
+            - { profile: PROVIDER_5XX,        weight: 12 }  # UNAVAILABLE
+            - { profile: INVALID_RECIPIENT,   weight: 5 }   # INVALID_ARGUMENT
+            - { profile: SILENT_SUCCESS,      weight: 3 }
+
+    # -------------------------------------------------------------------------
+    # Mock webhook emitter.
+    #
+    # Not yet consumed by a @ConfigurationProperties class -- the emitter is
+    # still to be written -- but the numbers belong here rather than as
+    # constants, because each one exists to make a specific defence REAL
+    # instead of assumed:
+    #
+    #   out-of-order 5%  -> the monotonic guard in DeliveryStatus.transitionTo
+    #   duplicate    2%  -> the idempotent receiver
+    #   loss         1%  -> the reconciler; nothing else would ever find these
+    #   delay 2-45 s     -> DELIVERED arriving long after we moved on
+    #
+    # The emitter calls our OWN public endpoint with a correct HMAC, so
+    # signature verification is genuinely exercised rather than bypassed.
+    # -------------------------------------------------------------------------
+    mock-webhook:
+      enabled: true
+      callback-base-url: ${MOCK_WEBHOOK_BASE:http://localhost:8080}
+      hmac-secret: ${MOCK_WEBHOOK_SECRET:local-development-hmac-secret-not-a-real-key}
+      signature-header: X-Notification-Signature
+      timestamp-tolerance: 5m
+      delay:
+        min: 2s
+        max: 45s
+      out-of-order-rate: 0.05
+      duplicate-rate: 0.02
+      loss-rate: 0.01
+
+    # Runtime chaos control, backed by the ChaosState bean. Makes the failover
+    # story demonstrable in thirty seconds instead of describable in ten
+    # minutes:
+    #   POST /admin/v1/mock-providers/mock-sms-primary/chaos
+    #        {"mode":"HARD_DOWN","durationSeconds":120}
+    # See `make demo`.
+    mock-chaos:
+      enabled: true
+      admin-path: /admin/v1/mock-providers
+
+  # ---------------------------------------------------------------------------
+  # Inbound webhook verification (spec §13, docs/API.md).
+  #
+  # A provider with no entry under `providers` cannot post at all. That is the
+  # intended default: an unknown providerCode falling through to a shared secret
+  # would make this an unauthenticated write path into the delivery state
+  # machine, where a forged DELIVERED marks a failed OTP as sent and suppresses
+  # the retry.
+  #
+  # `allowed-ips` is empty here and must not be in production -- it is the one
+  # gate an attacker holding a leaked secret cannot satisfy from their own
+  # network.
+  # ---------------------------------------------------------------------------
+  webhooks:
+    signature-header: X-Signature
+    timestamp-header: X-Timestamp
+    timestamp-tolerance: 5m
+    providers:
+      mock-sms-primary:
+        secret: ${MOCK_WEBHOOK_SECRET:local-development-hmac-secret-not-a-real-key}
+      mock-sms-secondary:
+        secret: ${MOCK_WEBHOOK_SECRET:local-development-hmac-secret-not-a-real-key}
+      mock-email-primary:
+        secret: ${MOCK_WEBHOOK_SECRET:local-development-hmac-secret-not-a-real-key}
+      mock-email-secondary:
+        secret: ${MOCK_WEBHOOK_SECRET:local-development-hmac-secret-not-a-real-key}
+      mock-push-primary:
+        secret: ${MOCK_WEBHOOK_SECRET:local-development-hmac-secret-not-a-real-key}
+
+  # ---------------------------------------------------------------------------
+  # API authentication.
+  #
+  # `permit-all: false` is the default and is stated explicitly rather than
+  # omitted, because the value of this flag is the difference between a secured
+  # API and an open one -- it should be visible in a diff, not inferred from a
+  # record's default.
+  # ---------------------------------------------------------------------------
+  api:
+    security:
+      permit-all: false
+
+logging:
+  level:
+    root: INFO
+    dev.gaurav.notification: INFO
+    org.apache.kafka.clients.NetworkClient: WARN
+
+---
+# =============================================================================
+# local profile — developer conveniences only. Nothing here may change
+# behaviour that a test depends on.
+# =============================================================================
+spring:
+  config:
+    activate:
+      on-profile: local
+
+  jpa:
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+
+  # Kept as a belt-and-braces fallback. With SecurityConfig.permitAllFilterChain
+  # active (see notification.api.security.permit-all below) these credentials are
+  # never consulted; they still matter if somebody runs the local profile with
+  # permit-all switched off, because the alternative is Boot's generated password
+  # printed once at startup, which Prometheus cannot scrape and nobody can curl
+  # twice.
+  security:
+    user:
+      name: local
+      password: local
+      roles: ACTUATOR
+
+notification:
+  api:
+    security:
+      # LOCAL ONLY, and the most dangerous line in this file. Every request is
+      # unauthenticated and attributed to the fixed development tenant, so
+      # `./mvnw spring-boot:run` plus a curl is a working demo with no token
+      # ceremony. SecurityConfig prints a five-line banner whenever this is true;
+      # if that banner ever appears in a deployed environment's logs, that is the
+      # incident.
+      permit-all: true
+
+logging:
+  level:
+    dev.gaurav.notification: DEBUG
+    org.flywaydb: INFO
+    org.hibernate.SQL: INFO
+    # Uncomment when a query plan is in question. Left off by default because
+    # it logs recipient addresses, which is PII.
+    # org.hibernate.orm.jdbc.bind: TRACE
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "*"

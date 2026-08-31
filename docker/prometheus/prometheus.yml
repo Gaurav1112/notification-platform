@@ -1,0 +1,91 @@
+# =============================================================================
+# Local Prometheus configuration.
+#
+# In production this file does not exist: the apps export OTLP to an OpenTelemetry
+# Collector which remote-writes to Amazon Managed Prometheus, and the rule files
+# below are applied as AMP rule groups. The rules themselves are identical --
+# that is the point of keeping them here rather than in a Grafana panel. A rule
+# that only exists inside a dashboard cannot page anyone.
+#
+# The three apps run on the HOST, so targets are host.docker.internal.
+# =============================================================================
+
+global:
+  # 15s, not the 1m default. dispatch_latency for CRITICAL has a 5-second p99
+  # objective; a 1-minute scrape cannot see a 5-second regression before the
+  # burn-rate windows have already smeared it.
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    env: local
+    cluster: notification-platform-local
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+
+  # ---------------------------------------------------------------------------
+  # The three deployables. `honor_labels: false` so `job` here always wins over
+  # anything the app might self-report -- the recording rules key off `job`.
+  # ---------------------------------------------------------------------------
+  - job_name: notification-api
+    metrics_path: /actuator/prometheus
+    # Basic auth is a LOCAL stopgap. spring-boot-starter-security is on the
+    # classpath and, until platform-security ships a SecurityFilterChain that
+    # permits EndpointRequest.to(HealthEndpoint, InfoEndpoint,
+    # PrometheusScrapeEndpoint), every actuator endpoint answers 401 and this
+    # target silently reports `down` — which disarms every burn-rate alert.
+    # Once the chain lands, the header is ignored and this block can go.
+    basic_auth:
+      username: local
+      password: local
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+        labels:
+          app: notification-api
+          tier: ingest
+
+  - job_name: notification-worker
+    metrics_path: /actuator/prometheus
+    # Basic auth is a LOCAL stopgap. spring-boot-starter-security is on the
+    # classpath and, until platform-security ships a SecurityFilterChain that
+    # permits EndpointRequest.to(HealthEndpoint, InfoEndpoint,
+    # PrometheusScrapeEndpoint), every actuator endpoint answers 401 and this
+    # target silently reports `down` — which disarms every burn-rate alert.
+    # Once the chain lands, the header is ignored and this block can go.
+    basic_auth:
+      username: local
+      password: local
+    static_configs:
+      - targets: ["host.docker.internal:8082"]
+        labels:
+          app: notification-worker
+          tier: dispatch
+
+  - job_name: notification-scheduler
+    metrics_path: /actuator/prometheus
+    # Basic auth is a LOCAL stopgap. spring-boot-starter-security is on the
+    # classpath and, until platform-security ships a SecurityFilterChain that
+    # permits EndpointRequest.to(HealthEndpoint, InfoEndpoint,
+    # PrometheusScrapeEndpoint), every actuator endpoint answers 401 and this
+    # target silently reports `down` — which disarms every burn-rate alert.
+    # Once the chain lands, the header is ignored and this block can go.
+    basic_auth:
+      username: local
+      password: local
+    static_configs:
+      - targets: ["host.docker.internal:8083"]
+        labels:
+          app: notification-scheduler
+          tier: schedule
+
+  # ---------------------------------------------------------------------------
+  # Self-scrape. Cheap, and it is how you find out that rule evaluation is
+  # falling behind (prometheus_rule_group_last_duration_seconds) before the
+  # burn-rate alerts start firing late.
+  # ---------------------------------------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

@@ -1,0 +1,165 @@
+{
+  "uid": "np-operational",
+  "title": "Notification Platform — Operational",
+  "tags": ["notification-platform", "operational"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "description": "Everything here reads a recording rule from docker/prometheus/rules/notification-slo.yml, never a raw ad-hoc expression. A panel with its own copy of the SLI definition drifts from the alert that pages, and then the graph and the page disagree during an incident.",
+  "panels": [
+    {
+      "type": "row",
+      "title": "SLOs",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "type": "stat",
+      "title": "API availability (30d) — SLO 99.95%",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 1 },
+      "targets": [{ "refId": "A", "expr": "sli:api_availability:ratio_30d" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 4,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0.9995 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Availability error-budget burn rate (page at 14.4x)",
+      "description": "Plotted as a multiple of the budget so the alert threshold is a horizontal line at 14.4 rather than a number nobody can eyeball.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 12, "x": 6, "y": 1 },
+      "targets": [
+        { "refId": "A", "expr": "sli:api_availability:error_ratio_5m / 0.0005", "legendFormat": "5m" },
+        { "refId": "B", "expr": "sli:api_availability:error_ratio_1h / 0.0005", "legendFormat": "1h" },
+        { "refId": "C", "expr": "sli:api_availability:error_ratio_6h / 0.0005", "legendFormat": "6h" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": { "fillOpacity": 5 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 6 },
+              { "color": "red", "value": 14.4 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Accept latency p99 — objective 250 ms",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 1 },
+      "targets": [{ "refId": "A", "expr": "sli:api_accept_latency:p99_5m" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.25 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "Pipeline",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Dispatch latency p99 by traffic class — CRITICAL must stay under 5 s",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 7 },
+      "targets": [
+        { "refId": "A", "expr": "sli:dispatch_latency:p99_5m", "legendFormat": "{{traffic_class}} / {{channel}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "type": "timeseries",
+      "title": "Consumer lag by group — read WITH the commit rate below, never alone",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 7 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (consumergroup) (kafka_consumergroup_lag)", "legendFormat": "{{consumergroup}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+    },
+    {
+      "type": "timeseries",
+      "title": "Consumer commit rate — flat zero here with rising lag above is a poison pill",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 14 },
+      "targets": [
+        { "refId": "A", "expr": "kafka_consumer_coordinator_commit_rate", "legendFormat": "{{client_id}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] }
+    },
+    {
+      "type": "timeseries",
+      "title": "DLQ entries per minute (page at 100)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 6, "x": 12, "y": 14 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (channel) (rate(notification_dlq_total[5m])) * 60", "legendFormat": "{{channel}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbox — oldest unpublished row age (page at 120 s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 6, "x": 18, "y": 14 },
+      "targets": [{ "refId": "A", "expr": "outbox_oldest_age_seconds", "legendFormat": "oldest" }],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "type": "row",
+      "title": "Providers",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 21 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Circuit state by provider (0 CLOSED · 1 OPEN · 2 HALF_OPEN · 3 FORCED_OPEN)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 22 },
+      "targets": [
+        { "refId": "A", "expr": "provider_circuit_state", "legendFormat": "{{provider}} / {{channel}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+    },
+    {
+      "type": "timeseries",
+      "title": "Delivery success rate by channel (INVALID_RECIPIENT excluded)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 22 },
+      "targets": [
+        { "refId": "A", "expr": "sli:delivery_success:ratio_30m", "legendFormat": "{{channel}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 }, "overrides": [] }
+    }
+  ]
+}

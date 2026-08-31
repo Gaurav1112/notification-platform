@@ -1,0 +1,762 @@
+# =============================================================================
+# SLI recording rules and alerts for the notification platform.
+#
+# Two principles, both from spec §12 and §22.8:
+#
+#   1. An SLO you cannot compute is a slogan. Every SLI in §1.4 has a recording
+#      rule here, named after the SLI, so "what is our accept latency" has one
+#      answer rather than one per dashboard.
+#
+#   2. Alert on burn rate and on CONJUNCTIONS, never on a raw threshold and
+#      never on lag alone. Lag alone is ambiguous -- it is equally consistent
+#      with a poison pill, a stuck poll, a provider outage and a healthy
+#      catch-up after a deploy. Each of those needs a different response, so a
+#      single "lag > N" alert trains the on-call to ignore it.
+#
+# Metric names are the contract from spec §12. Rules referencing a metric that
+# is not emitted yet simply produce no series -- they do not error. Anything
+# requiring an exporter that is not in the local compose stack (postgres_exporter,
+# kafka_exporter) is marked LOCAL: NO DATA.
+#
+# NaN is load-bearing here. With zero traffic every ratio is 0/0 = NaN, and
+# every comparison against NaN is false, so an idle laptop does not page.
+# =============================================================================
+
+groups:
+
+  # ===========================================================================
+  # SLIs -- spec §1.4
+  # ===========================================================================
+  - name: notification-sli
+    interval: 15s
+    rules:
+
+      # -- api_availability: non-5xx / total on POST /v1/notifications --------
+      # Recorded as the ERROR ratio, not the success ratio. Burn-rate maths is
+      # expressed in error budget consumed, and (1 - success) loses float
+      # precision exactly where the numbers are small and it matters.
+      - record: sli:api_availability:error_ratio_5m
+        expr: |
+          sum(rate(http_server_requests_seconds_count{job="notification-api",uri="/v1/notifications",method="POST",status=~"5.."}[5m]))
+            /
+          sum(rate(http_server_requests_seconds_count{job="notification-api",uri="/v1/notifications",method="POST"}[5m]))
+
+      - record: sli:api_availability:error_ratio_30m
+        expr: |
+          sum(rate(http_server_requests_seconds_count{job="notification-api",uri="/v1/notifications",method="POST",status=~"5.."}[30m]))
+            /
+          sum(rate(http_server_requests_seconds_count{job="notification-api",uri="/v1/notifications",method="POST"}[30m]))
+
+      - record: sli:api_availability:error_ratio_1h
+        expr: |
+          sum(rate(http_server_requests_seconds_count{job="notification-api",uri="/v1/notifications",method="POST",status=~"5.."}[1h]))
+            /
+          sum(rate(http_server_requests_seconds_count{job="notification-api",uri="/v1/notifications",method="POST"}[1h]))
+
+      - record: sli:api_availability:error_ratio_6h
+        expr: |
+          sum(rate(http_server_requests_seconds_count{job="notification-api",uri="/v1/notifications",method="POST",status=~"5.."}[6h]))
+            /
+          sum(rate(http_server_requests_seconds_count{job="notification-api",uri="/v1/notifications",method="POST"}[6h]))
+
+      # 30-day compliance number for the executive dashboard. Not used by any
+      # alert -- by the time a 30d window moves, the incident is history.
+      - record: sli:api_availability:ratio_30d
+        expr: |
+          1 - (
+            sum(increase(http_server_requests_seconds_count{job="notification-api",uri="/v1/notifications",method="POST",status=~"5.."}[30d]))
+              /
+            sum(increase(http_server_requests_seconds_count{job="notification-api",uri="/v1/notifications",method="POST"}[30d]))
+          )
+
+      # -- accept_latency: p95 < 100 ms, p99 < 250 ms ------------------------
+      # The burn-rate form counts requests slower than 250 ms as "bad events",
+      # which is what an SLO needs. A p99 quantile cannot be burn-rated: you
+      # cannot average or window-aggregate quantiles, and histogram_quantile
+      # over a long window answers a different question than over a short one.
+      - record: sli:api_accept_latency:bad_ratio_5m
+        expr: |
+          1 - (
+            sum(rate(http_server_requests_seconds_bucket{job="notification-api",uri="/v1/notifications",method="POST",le="0.25"}[5m]))
+              /
+            sum(rate(http_server_requests_seconds_count{job="notification-api",uri="/v1/notifications",method="POST"}[5m]))
+          )
+
+      - record: sli:api_accept_latency:bad_ratio_30m
+        expr: |
+          1 - (
+            sum(rate(http_server_requests_seconds_bucket{job="notification-api",uri="/v1/notifications",method="POST",le="0.25"}[30m]))
+              /
+            sum(rate(http_server_requests_seconds_count{job="notification-api",uri="/v1/notifications",method="POST"}[30m]))
+          )
+
+      - record: sli:api_accept_latency:bad_ratio_1h
+        expr: |
+          1 - (
+            sum(rate(http_server_requests_seconds_bucket{job="notification-api",uri="/v1/notifications",method="POST",le="0.25"}[1h]))
+              /
+            sum(rate(http_server_requests_seconds_count{job="notification-api",uri="/v1/notifications",method="POST"}[1h]))
+          )
+
+      - record: sli:api_accept_latency:bad_ratio_6h
+        expr: |
+          1 - (
+            sum(rate(http_server_requests_seconds_bucket{job="notification-api",uri="/v1/notifications",method="POST",le="0.25"}[6h]))
+              /
+            sum(rate(http_server_requests_seconds_count{job="notification-api",uri="/v1/notifications",method="POST"}[6h]))
+          )
+
+      # Displayed quantiles. Dashboard only -- see the note above.
+      - record: sli:api_accept_latency:p95_5m
+        expr: |
+          histogram_quantile(0.95, sum by (le) (
+            rate(http_server_requests_seconds_bucket{job="notification-api",uri="/v1/notifications",method="POST"}[5m])
+          ))
+
+      - record: sli:api_accept_latency:p99_5m
+        expr: |
+          histogram_quantile(0.99, sum by (le) (
+            rate(http_server_requests_seconds_bucket{job="notification-api",uri="/v1/notifications",method="POST"}[5m])
+          ))
+
+      # -- dispatch_latency: accept -> first provider call, per traffic class -
+      # CRITICAL p99 < 5 s is the only hard objective; the others are tracked.
+      - record: sli:dispatch_latency:p99_5m
+        expr: |
+          histogram_quantile(0.99, sum by (le, traffic_class, channel) (
+            rate(notification_dispatch_latency_seconds_bucket[5m])
+          ))
+
+      - record: sli:dispatch_latency_critical:bad_ratio_5m
+        expr: |
+          1 - (
+            sum(rate(notification_dispatch_latency_seconds_bucket{traffic_class="CRITICAL",le="5.0"}[5m]))
+              /
+            sum(rate(notification_dispatch_latency_seconds_count{traffic_class="CRITICAL"}[5m]))
+          )
+
+      - record: sli:dispatch_latency_critical:bad_ratio_1h
+        expr: |
+          1 - (
+            sum(rate(notification_dispatch_latency_seconds_bucket{traffic_class="CRITICAL",le="5.0"}[1h]))
+              /
+            sum(rate(notification_dispatch_latency_seconds_count{traffic_class="CRITICAL"}[1h]))
+          )
+
+      # -- delivery_success_rate, per channel --------------------------------
+      # INVALID_RECIPIENT is excluded from the denominator on purpose. A wrong
+      # phone number is the caller's data-quality problem; counting it against
+      # us makes the SLI move when a tenant uploads a bad list and hides real
+      # provider degradation underneath it.
+      - record: sli:delivery_success:ratio_30m
+        expr: |
+          sum by (channel) (rate(notification_delivery_total{terminal_status="DELIVERED"}[30m]))
+            /
+          sum by (channel) (rate(notification_delivery_total{terminal_status=~"DELIVERED|FAILED",failure_type!="INVALID_RECIPIENT"}[30m]))
+
+      # -- duplicate_rate: < 0.01% -------------------------------------------
+      - record: sli:duplicate_delivery:ratio_1h
+        expr: |
+          sum(rate(notification_duplicate_delivery_total[1h]))
+            /
+          sum(rate(notification_delivery_total{terminal_status="DELIVERED"}[1h]))
+
+      # -- scheduler_lag: now - scheduled_at at dispatch, p99 < 30 s ---------
+      - record: sli:scheduler_lag:p99_5m
+        expr: |
+          histogram_quantile(0.99, sum by (le) (
+            rate(scheduler_dispatch_lag_seconds_bucket[5m])
+          ))
+
+      - record: sli:scheduler_lag:bad_ratio_30m
+        expr: |
+          1 - (
+            sum(rate(scheduler_dispatch_lag_seconds_bucket{le="30.0"}[30m]))
+              /
+            sum(rate(scheduler_dispatch_lag_seconds_count[30m]))
+          )
+
+      # -- acceptance_durability: 99.999% ------------------------------------
+      # Deliberately a COUNTED numerator, not the difference of two rates.
+      # accepted_rate - terminal_rate has an error bar orders of magnitude
+      # wider than 1e-5 (pipeline transit time alone moves it), so a five-nines
+      # SLI computed that way measures nothing. `notification_lost_total` is
+      # emitted by the nightly reconciliation job: accepted rows past TTL with
+      # no terminal state and no DLQ record. Sitting in the DLQ is visible and
+      # therefore does NOT count as lost (spec §1.5).
+      - record: sli:acceptance_durability:error_ratio_1h
+        expr: |
+          sum(rate(notification_lost_total[1h]))
+            /
+          sum(rate(notification_accepted_total[1h]))
+
+      - record: sli:acceptance_durability:error_ratio_6h
+        expr: |
+          sum(rate(notification_lost_total[6h]))
+            /
+          sum(rate(notification_accepted_total[6h]))
+
+      # -- supporting series used by several alerts --------------------------
+      - record: sli:retry:ratio_15m
+        expr: |
+          sum(rate(notification_retry_total[15m]))
+            /
+          sum(rate(notification_dispatch_attempt_total[15m]))
+
+      - record: sli:kafka_partition_skew:ratio
+        expr: |
+          max by (job, client_id) (kafka_consumer_fetch_manager_records_lag)
+            /
+          avg by (job, client_id) (kafka_consumer_fetch_manager_records_lag)
+
+  # ===========================================================================
+  # Error-budget burn -- multi-window, multi-burn-rate.
+  #
+  # Two windows per alert, always. The long window says "the budget really is
+  # burning"; the short window says "it is STILL burning right now". Without
+  # the short window an alert stays lit for a full long-window after the
+  # incident is over, and the on-call learns to close it unread.
+  #
+  #   fast: 14.4x for 1h  (2% of a 30-day budget in one hour)  -> page, for 2m
+  #   slow:  6.0x for 6h  (5% of a 30-day budget in six hours) -> ticket, 15m
+  #
+  # The short window is 1/12 of the long one in both cases (5m / 30m), which is
+  # the Google SRE pairing and keeps the detection/reset trade-off symmetric.
+  # ===========================================================================
+  - name: notification-slo-burn
+    interval: 30s
+    rules:
+
+      # -- api_availability, SLO 99.95% -> budget 0.0005 ---------------------
+      - alert: NotificationApiErrorBudgetFastBurn
+        expr: |
+          (sli:api_availability:error_ratio_1h > (14.4 * 0.0005))
+            and
+          (sli:api_availability:error_ratio_5m > (14.4 * 0.0005))
+        for: 2m
+        labels:
+          severity: page
+          slo: api_availability
+          burn: fast
+        annotations:
+          summary: "POST /v1/notifications is burning the availability budget 14.4x"
+          description: >-
+            5xx ratio is {{ $value | humanizePercentage }} over 1h and still elevated
+            over the last 5m. At this rate the 30-day budget (21.6 min) is gone in
+            about 2 days. The 5m arm is what distinguishes this from a blip that
+            already recovered.
+          runbook: docs/RUNBOOK.md#first-five-minutes-of-an-incident
+
+      - alert: NotificationApiErrorBudgetSlowBurn
+        expr: |
+          (sli:api_availability:error_ratio_6h > (6 * 0.0005))
+            and
+          (sli:api_availability:error_ratio_30m > (6 * 0.0005))
+        for: 15m
+        labels:
+          severity: ticket
+          slo: api_availability
+          burn: slow
+        annotations:
+          summary: "POST /v1/notifications is burning the availability budget 6x"
+          description: >-
+            Not page-worthy on its own, but sustained. This is the shape of a
+            partial dependency failure -- one AZ, one provider, one bad pod --
+            that a threshold alert never catches.
+          runbook: docs/RUNBOOK.md#consumer-lag-spike
+
+      # -- accept_latency, p99 < 250 ms; treat 1% slow as the budget ---------
+      - alert: NotificationAcceptLatencyFastBurn
+        expr: |
+          (sli:api_accept_latency:bad_ratio_1h > (14.4 * 0.01))
+            and
+          (sli:api_accept_latency:bad_ratio_5m > (14.4 * 0.01))
+        for: 2m
+        labels:
+          severity: page
+          slo: accept_latency
+          burn: fast
+        annotations:
+          summary: "accept latency budget burning 14.4x -- >14% of accepts slower than 250 ms"
+          description: >-
+            The accept path is three writes and a Kafka produce. Latency here almost
+            always means Postgres (lock wait, connection saturation) or the outbox
+            fast-path blocking on an unreachable broker.
+          runbook: docs/RUNBOOK.md#outbox-age-growing
+
+      - alert: NotificationAcceptLatencySlowBurn
+        expr: |
+          (sli:api_accept_latency:bad_ratio_6h > (6 * 0.01))
+            and
+          (sli:api_accept_latency:bad_ratio_30m > (6 * 0.01))
+        for: 15m
+        labels:
+          severity: ticket
+          slo: accept_latency
+          burn: slow
+
+      # -- dispatch_latency for CRITICAL, p99 < 5 s --------------------------
+      - alert: CriticalDispatchLatencyFastBurn
+        expr: |
+          (sli:dispatch_latency_critical:bad_ratio_1h > (14.4 * 0.01))
+            and
+          (sli:dispatch_latency_critical:bad_ratio_5m > (14.4 * 0.01))
+        for: 2m
+        labels:
+          severity: page
+          slo: dispatch_latency
+          burn: fast
+        annotations:
+          summary: "CRITICAL notifications are missing the 5-second dispatch objective"
+          description: >-
+            CRITICAL is OTPs and security alerts. If this is firing while BULK is
+            healthy, the .tx lane is starved -- check whether a campaign is being
+            produced onto a tx topic, which is the failure the lane split exists
+            to prevent.
+          runbook: docs/RUNBOOK.md#provider-outage
+
+      # -- acceptance_durability, SLO 99.999% -> budget 1e-5 -----------------
+      # No fast-burn arm: the reconciliation job that feeds it runs nightly, so
+      # a 5-minute window would be measuring the absence of a nightly job.
+      - alert: AcceptanceDurabilityBudgetBurn
+        expr: |
+          (sli:acceptance_durability:error_ratio_6h > (6 * 0.00001))
+            and
+          (sli:acceptance_durability:error_ratio_1h > (6 * 0.00001))
+        for: 30m
+        labels:
+          severity: page
+          slo: acceptance_durability
+          burn: slow
+        annotations:
+          summary: "accepted notifications are disappearing without reaching a terminal state"
+          description: >-
+            This is the one guarantee we publish (spec §1.5). A non-zero value means
+            the delivery contract is broken, not degraded. Do not close this by
+            adjusting the threshold.
+          runbook: docs/RUNBOOK.md#dlq-triage-and-replay
+
+  # ===========================================================================
+  # Symptom alerts -- pages
+  # ===========================================================================
+  - name: notification-symptoms-page
+    interval: 30s
+    rules:
+
+      # -- consumer lag ------------------------------------------------------
+      # Two arms, because absolute lag and lag TREND are different failures.
+      # A 200k backlog that is draining after a deploy is fine; a 20k backlog
+      # that has grown monotonically for ten minutes is not.
+      - alert: ConsumerLagBacklog
+        expr: sum by (consumergroup, topic) (kafka_consumergroup_lag) > 100000
+        for: 5m
+        labels:
+          severity: page
+          component: kafka
+        annotations:
+          summary: "{{ $labels.consumergroup }} is {{ $value }} records behind on {{ $labels.topic }}"
+          runbook: docs/RUNBOOK.md#consumer-lag-spike
+
+      - alert: ConsumerLagGrowing
+        expr: |
+          (
+            deriv(sum by (consumergroup, topic) (kafka_consumergroup_lag)[10m:30s]) > 0
+          )
+            and
+          (
+            sum by (consumergroup, topic) (kafka_consumergroup_lag) > 10000
+          )
+        for: 10m
+        labels:
+          severity: page
+          component: kafka
+        annotations:
+          summary: "{{ $labels.consumergroup }} lag has grown for 10 minutes straight"
+          description: >-
+            Consumption is slower than production and is not catching up. Before
+            scaling out, check the provider circuit state -- KEDA scaling on lag
+            during a PROVIDER outage points more consumers at a recovering
+            provider and is a feedback loop in the wrong direction (spec §22.3).
+          runbook: docs/RUNBOOK.md#consumer-lag-spike
+
+      # -- THE POISON PILL CONJUNCTION ---------------------------------------
+      # The signature that no single metric shows: offsets are only committed
+      # after successful processing, so a record that always throws makes the
+      # consumer seek back forever. Throughput on that partition is EXACTLY
+      # zero while the consumer heartbeats, polls, and reports perfectly
+      # healthy. Group-level dashboards stay green; with hash(key) % partitions
+      # a deterministic subset of tenants simply receives nothing.
+      #
+      # Lag rising AND commit-rate at zero is the conjunction. Neither half is
+      # alertable alone: lag rises during any backlog, and commit-rate is zero
+      # on any idle consumer.
+      - alert: KafkaPoisonPillSuspected
+        expr: |
+          (
+            deriv(kafka_consumer_fetch_manager_records_lag_max[10m]) > 0
+          )
+            and on (job, client_id)
+          (
+            max by (job, client_id) (kafka_consumer_coordinator_commit_rate) < 0.01
+          )
+        for: 5m
+        labels:
+          severity: page
+          component: kafka
+          signature: poison-pill
+        annotations:
+          summary: "poison pill on {{ $labels.client_id }} -- lag rising while commit rate is zero"
+          description: >-
+            Do NOT restart the consumer; it will re-read the same record. Find the
+            offset, capture the payload, route it to the DLQ and COMMIT the offset.
+            A poison message must never block a partition.
+          runbook: docs/RUNBOOK.md#poison-message
+
+      - alert: KafkaStuckPoll
+        expr: |
+          (
+            max by (job, client_id) (kafka_consumer_fetch_manager_records_lag_max) > 1000
+          )
+            and on (job, client_id)
+          (
+            max by (job, client_id) (kafka_consumer_fetch_manager_records_consumed_rate) < 0.01
+          )
+        for: 5m
+        labels:
+          severity: page
+          component: kafka
+          signature: stuck-poll
+        annotations:
+          summary: "{{ $labels.client_id }} has a non-zero backlog and is consuming nothing"
+          description: >-
+            Distinguished from a poison pill by records-consumed-rate: a poison pill
+            consumes the same record repeatedly, a stuck poll consumes nothing at
+            all. Usually an unbounded provider call inside the poll loop.
+          runbook: docs/RUNBOOK.md#consumer-lag-spike
+
+      - alert: KafkaRebalanceStorm
+        expr: |
+          (
+            max by (job, client_id) (kafka_consumer_coordinator_rebalance_rate_per_hour) > 6
+          )
+            and on (job, client_id)
+          (
+            deriv(kafka_consumer_coordinator_last_rebalance_seconds_ago[15m]) < 0
+          )
+        for: 10m
+        labels:
+          severity: page
+          component: kafka
+          signature: rebalance-storm
+        annotations:
+          summary: "rebalance storm on {{ $labels.client_id }}"
+          description: >-
+            KIP-62 moved heartbeats to a background thread, so a consumer stuck in a
+            slow provider call still heartbeats and looks alive while
+            max.poll.interval.ms runs out. NEVER fix this by raising
+            max.poll.interval.ms -- bound the provider call instead.
+          runbook: docs/RUNBOOK.md#consumer-lag-spike
+
+      # -- DLQ ---------------------------------------------------------------
+      - alert: DlqRateHigh
+        expr: sum(rate(notification_dlq_total[5m])) * 60 > 100
+        for: 5m
+        labels:
+          severity: page
+          component: dlq
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} notifications/min entering the DLQ"
+          description: >-
+            Triage by failure_type BEFORE replaying anything. Replaying a
+            deterministic poison in bulk recreates the identical storm, which is why
+            replay targets notification.retry.5s and never the main topic.
+          runbook: docs/RUNBOOK.md#dlq-triage-and-replay
+
+      - alert: DlqBacklogGrowing
+        expr: dlq_backlog_size > 10000
+        for: 30m
+        labels:
+          severity: ticket
+          component: dlq
+        annotations:
+          summary: "DLQ backlog is {{ $value }} and nobody is draining it"
+          runbook: docs/RUNBOOK.md#dlq-triage-and-replay
+
+      # -- providers ---------------------------------------------------------
+      - alert: AllProvidersOpenForChannel
+        expr: |
+          (count by (channel) (provider_circuit_state{state="OPEN"} == 1))
+            ==
+          (count by (channel) (provider_circuit_state))
+        for: 1m
+        labels:
+          severity: page
+          component: provider
+        annotations:
+          summary: "every provider for {{ $labels.channel }} has an OPEN circuit"
+          description: >-
+            No failover target remains. Traffic for this channel is parking in
+            notification.retry.1h. Decide explicitly whether to force a circuit
+            closed for CRITICAL only, or to shed.
+          runbook: docs/RUNBOOK.md#provider-outage
+
+      # -- scheduler ---------------------------------------------------------
+      - alert: SchedulerLagHigh
+        expr: sli:scheduler_lag:p99_5m > 60
+        for: 10m
+        labels:
+          severity: page
+          component: scheduler
+        annotations:
+          summary: "scheduler dispatch lag p99 is {{ $value | printf \"%.0fs\" }} (objective 30 s)"
+          description: >-
+            Check the hydrator leader first. A lost leader election means nothing is
+            scanning for due rows and lag climbs linearly with wall clock, which is
+            the distinguishing shape.
+          runbook: docs/RUNBOOK.md#scheduler-lag
+
+      - alert: SchedulerLeaseExpiryHigh
+        expr: sum(rate(scheduler_lease_expired_total[10m])) > 1
+        for: 10m
+        labels:
+          severity: ticket
+          component: scheduler
+        annotations:
+          summary: "scheduler claims are expiring before dispatch"
+          description: >-
+            Claimers are taking longer than the lease. Every expired lease is work
+            done twice; the monotonic guard makes that safe but not free.
+          runbook: docs/RUNBOOK.md#scheduler-lag
+
+      # -- outbox ------------------------------------------------------------
+      - alert: OutboxAgeHigh
+        expr: outbox_oldest_age_seconds > 120
+        for: 2m
+        labels:
+          severity: page
+          component: outbox
+        annotations:
+          summary: "oldest unpublished outbox row is {{ $value | printf \"%.0fs\" }} old"
+          description: >-
+            The accept transaction is still committing, so nothing is lost -- but
+            notifications are not moving. Almost always Kafka unreachable or the
+            sweeper pod down. Outbox depth over 500k triggers BULK shedding at the
+            API by design.
+          runbook: docs/RUNBOOK.md#outbox-age-growing
+
+      - alert: OutboxDepthShedding
+        expr: outbox_pending_count > 500000
+        for: 2m
+        labels:
+          severity: page
+          component: outbox
+        annotations:
+          summary: "outbox depth {{ $value }} -- BULK ingest is being shed with 503"
+          runbook: docs/RUNBOOK.md#outbox-age-growing
+
+      # -- duplicates --------------------------------------------------------
+      # Fires at 0.1%, TEN TIMES the 0.01% SLO. The SLO is a 30-day budget the
+      # slow-burn rule already tracks; this page is for a systemic break -- a
+      # provider replaying callbacks, or the idempotency layer failing open. A
+      # page at exactly the SLO threshold fires on statistical noise at low
+      # volume and gets muted within a week.
+      - alert: DuplicateDeliverySystemic
+        expr: sli:duplicate_delivery:ratio_1h > 0.001
+        for: 10m
+        labels:
+          severity: page
+          component: idempotency
+        annotations:
+          summary: "duplicate delivery rate {{ $value | humanizePercentage }} -- 10x the SLO"
+          description: >-
+            Check redis_fallback_active first. Idempotency falling back to Postgres
+            is correct but slower, and a timeout there fails open.
+          runbook: docs/RUNBOOK.md#first-five-minutes-of-an-incident
+
+  # ===========================================================================
+  # Symptom alerts -- tickets (causes, not symptoms; nobody wakes up for these)
+  # ===========================================================================
+  - name: notification-symptoms-ticket
+    interval: 1m
+    rules:
+
+      - alert: SingleProviderDegraded
+        expr: provider_circuit_state{state="OPEN"} == 1
+        for: 5m
+        labels:
+          severity: ticket
+          component: provider
+        annotations:
+          summary: "{{ $labels.provider }} circuit OPEN for {{ $labels.channel }}"
+          description: >-
+            Failover is working; this is informational unless it is the last one
+            standing, which AllProvidersOpenForChannel covers separately.
+          runbook: docs/RUNBOOK.md#provider-outage
+
+      - alert: HalfOpenProbeStampede
+        expr: sum by (provider) (rate(provider_failover_total[5m])) > 5
+        for: 10m
+        labels:
+          severity: ticket
+          component: provider
+        annotations:
+          summary: "{{ $labels.provider }} is flapping between OPEN and CLOSED"
+          description: >-
+            permittedNumberOfCallsInHalfOpenState is per JVM. Forty pods that opened
+            at the same instant with the same wait duration send 400 synchronised
+            probes at a recovering provider -- the exact herd the breaker exists to
+            prevent (spec §22.2). Check that waitDurationInOpenState jitter is on.
+          runbook: docs/RUNBOOK.md#provider-outage
+
+      - alert: RetryRateHigh
+        expr: sli:retry:ratio_15m > 0.20
+        for: 15m
+        labels:
+          severity: ticket
+          component: retry
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of dispatch attempts are retries"
+          description: >-
+            The per-JVM retry token budget is 10%. Above 20% sustained means the
+            budget is being refilled faster than the failure rate justifies, and
+            retries are now a sustaining loop rather than a recovery mechanism.
+          runbook: docs/RUNBOOK.md#provider-outage
+
+      - alert: RedisFallbackActive
+        expr: redis_fallback_active == 1
+        for: 5m
+        labels:
+          severity: ticket
+          component: valkey
+        annotations:
+          summary: "Valkey is unavailable; idempotency and quota are on the Postgres path"
+          description: >-
+            Correctness is preserved, quality is not: expect more duplicate provider
+            calls and weaker frequency capping. Quota fails OPEN deliberately -- we
+            do not reject paying customers over a cache.
+          runbook: docs/RUNBOOK.md#first-five-minutes-of-an-incident
+
+      - alert: KafkaPartitionSkew
+        expr: sli:kafka_partition_skew:ratio > 3
+        for: 5m
+        labels:
+          severity: ticket
+          component: kafka
+        annotations:
+          summary: "max/mean partition lag is {{ $value | printf \"%.1f\" }}x on {{ $labels.client_id }}"
+          description: >-
+            With recipientId in the key, 4-sigma spread is 0.337%. Every real hot
+            partition is a bug or an adversary, never hashing: a tenantId-only key,
+            a time component in the key, a campaign emitted in ID order, or a
+            runaway recipient.
+          runbook: docs/RUNBOOK.md#consumer-lag-spike
+
+      # -- THE DEFAULT PARTITION TRAP ----------------------------------------
+      # A DEFAULT partition exists so that a missing daily partition is not a
+      # hard outage. But a row landing in it BLOCKS creation of the real
+      # partition while holding an exclusive lock -- so the safety net becomes
+      # the outage a week later, at 02:00, during partition maintenance.
+      # It is a net with an alarm on it, never a destination. Non-zero is
+      # always actionable, hence `> 0` rather than a threshold.
+      - alert: DefaultPartitionNonEmpty
+        expr: notification_default_partition_rows > 0
+        for: 5m
+        labels:
+          severity: ticket
+          component: postgres
+        annotations:
+          summary: "{{ $value }} rows in the DEFAULT partition of {{ $labels.table }}"
+          description: >-
+            Move them out and create the missing partition BEFORE the next
+            maintenance window. ATTACH of the real partition will fail while any
+            row that belongs to it sits in DEFAULT.
+          runbook: docs/RUNBOOK.md#default-partition-non-empty
+
+      # LOCAL: NO DATA -- needs postgres_exporter, which is not in the local stack.
+      - alert: ReplicationSlotRetainingWal
+        expr: pg_replication_slot_retained_wal_bytes > 10 * 1024 * 1024 * 1024
+        for: 15m
+        labels:
+          severity: ticket
+          component: postgres
+        annotations:
+          summary: "slot {{ $labels.slot_name }} is pinning {{ $value | humanize1024 }}B of WAL"
+          description: >-
+            An inactive slot pins WAL forever and fills the data volume, which takes
+            the PRIMARY down -- a disabled consumer becomes a database outage. Decide
+            explicitly: resume the consumer or drop the slot.
+          runbook: docs/RUNBOOK.md#replication-slot-growth
+
+      - alert: PostgresReplicaLagHigh
+        expr: pg_replication_lag_seconds > 30
+        for: 10m
+        labels:
+          severity: ticket
+          component: postgres
+        annotations:
+          summary: "replica lag {{ $value | printf \"%.0fs\" }}"
+          description: >-
+            Status reads served from the replica will show stale state, which users
+            report as "the notification vanished".
+          runbook: docs/RUNBOOK.md#dr-failover
+
+      # -- THE METASTABLE FAILURE SIGNATURE ----------------------------------
+      # Offered load DROPS while the error rate does NOT. That combination means
+      # the system is sustaining its own failure: the trigger is gone, retries
+      # are keeping it in the failed state. An OSDI'22 study found at least 4 of
+      # the 15 major AWS outages of the prior decade were metastable failures,
+      # ~50% with retry policy as the sustaining effect.
+      #
+      # The response is the opposite of the instinct: STOP SCALING, START SHEDDING.
+      - alert: MetastableFailureSuspected
+        expr: |
+          (
+            sum(rate(notification_accepted_total[10m]))
+              <
+            0.7 * sum(rate(notification_accepted_total[10m] offset 30m))
+          )
+            and
+          (
+            sli:api_availability:error_ratio_5m > 0.05
+          )
+        for: 10m
+        labels:
+          severity: page
+          signature: metastable
+        annotations:
+          summary: "offered load has fallen 30% but errors have not -- suspected metastable failure"
+          description: >-
+            Fix the SUSTAINING loop, not the trigger. The next trigger will be
+            different and the failure state identical. Shed BULK, drop the retry
+            budget to zero, then reintroduce load.
+          runbook: docs/RUNBOOK.md#first-five-minutes-of-an-incident
+
+  # ===========================================================================
+  # Meta -- if this stops working, everything above is silently a no-op.
+  # ===========================================================================
+  - name: notification-meta
+    interval: 1m
+    rules:
+
+      - alert: ScrapeTargetDown
+        expr: up{job=~"notification-.*"} == 0
+        for: 2m
+        labels:
+          severity: page
+          component: observability
+        annotations:
+          summary: "{{ $labels.job }} has not been scrapeable for 2 minutes"
+          description: >-
+            Every burn-rate alert above evaluates to NaN with no data, and NaN
+            comparisons are false. A down target does not just lose dashboards, it
+            silently disarms the paging.
+          runbook: docs/RUNBOOK.md#first-five-minutes-of-an-incident
+
+      - alert: PrometheusRuleEvaluationFailing
+        expr: increase(prometheus_rule_evaluation_failures_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: ticket
+          component: observability
+        annotations:
+          summary: "rule group {{ $labels.rule_group }} is failing to evaluate"

@@ -1,0 +1,25 @@
+# =============================================================================
+# Dashboard provider.
+#
+# Dashboards are files on disk, not UI state. A dashboard that lives only in
+# Grafana's SQLite database disappears with the container and cannot be
+# reviewed in a diff -- which is how "the panel used to show that" happens.
+#
+# Drop any *.json into docker/grafana/dashboards/ and it appears within 10s.
+# =============================================================================
+
+apiVersion: 1
+
+providers:
+  - name: notification-platform
+    orgId: 1
+    folder: Notification Platform
+    type: file
+    # Editable in the UI for exploration, but edits are lost on restart. That
+    # is deliberate: the file is the source of truth, so export and commit.
+    disableDeletion: false
+    allowUiUpdates: false
+    updateIntervalSeconds: 10
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: true

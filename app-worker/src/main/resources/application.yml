@@ -1,0 +1,410 @@
+# =============================================================================
+# app-worker — the dispatch consumers.
+#
+# This is the process that talks to third parties, so almost every setting here
+# is a defence against a slow provider rather than a fast one. The governing
+# rule from docs/KAFKA.md §7: a consumer stuck in an unbounded provider call
+# still heartbeats (KIP-62 moved heartbeats to a background thread) and looks
+# perfectly alive while max.poll.interval.ms runs out. Throughput collapses to
+# zero while the Kafka cluster reports perfect health.
+#
+# The fix is to bound the provider call, not to raise the poll interval.
+#
+# NOTE: app-worker's pom has spring-boot-starter-actuator but no servlet
+# container, so /actuator/prometheus is not currently served over HTTP and the
+# `notification-worker` Prometheus job will show as down. Adding
+# spring-boot-starter-web to app-worker/pom.xml fixes it; that file belongs to
+# another module and is not edited here.
+# =============================================================================
+
+spring:
+  application:
+    name: notification-worker
+
+  profiles:
+    default: local
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:notification}
+    username: ${DB_USER:notification}
+    password: ${DB_PASSWORD:notification}
+    hikari:
+      pool-name: np-worker-pool
+      # Larger than the API's pool: every consumer thread writes a
+      # delivery_attempt row, and a thread waiting on a connection is a thread
+      # not polling, which is how poll-interval breaches start.
+      maximum-pool-size: ${DB_POOL_MAX:32}
+      minimum-idle: 8
+      connection-timeout: 3000
+      max-lifetime: 900000
+      leak-detection-threshold: 10000
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          # Delivery attempts and status rows are written in batches of 100.
+          # Row-at-a-time here is the difference between 1,500/s and 200/s.
+          batch_size: 100
+          time_zone: UTC
+        order_inserts: true
+        order_updates: true
+
+  flyway:
+    # Disabled on purpose. Migration has exactly one owner: locally that is
+    # app-api, in production a pre-deploy Job (spec §11). Three JVMs racing the
+    # same baseline on `docker compose up` produces a lock timeout, not a
+    # migration — and the one that loses looks like an application bug.
+    enabled: false
+    locations: classpath:db/migration
+    schemas: notif
+    default-schema: notif
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 200ms
+      connect-timeout: 200ms
+      lettuce:
+        # Unpooled — see app-api/src/main/resources/application.yml. Enabling
+        # the pool additionally requires org.apache.commons:commons-pool2,
+        # which is not on the classpath; Boot 4 fails the context rather than
+        # falling back.
+        pool:
+          enabled: false
+        shutdown-timeout: 200ms
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    producer:
+      # The worker produces to notification.delivery, the retry tiers and the
+      # DLQ. Unlike the API it has no latency budget to protect, so it gets the
+      # full 120 s delivery timeout — losing a delivery record is worse than
+      # being slow.
+      acks: all
+      retries: 2147483647
+      batch-size: 262144
+      compression-type: zstd
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5
+        delivery.timeout.ms: 120000
+        linger.ms: 25
+    consumer:
+      group-id: ${KAFKA_GROUP:notification-worker}
+      # client-id is not cosmetic: it is the label the poison-pill and
+      # stuck-poll conjunction rules group by
+      # (docker/prometheus/rules/notification-slo.yml). Leave it unset and
+      # every consumer reports as `consumer-1` and the rules cannot separate
+      # a stalled SMS partition from a healthy push one.
+      client-id: notification-worker
+      enable-auto-commit: false
+      auto-offset-reset: earliest
+      isolation-level: read-committed
+      # 100, not the default 500. Each record can cost a ~250 ms provider round
+      # trip; 500 of those is 125 s of work between polls against a 300 s
+      # interval, which leaves no margin for a single slow provider.
+      max-poll-records: 100
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        group.protocol: consumer
+        max.poll.interval.ms: 300000
+        # Never raise this as a fix for a stuck consumer. It costs failover
+        # time, and worst-case rebalance detection takes up to 2x the interval.
+        session.timeout.ms: 45000
+        heartbeat.interval.ms: 3000
+        spring.json.trusted.packages: dev.gaurav.notification.*
+    listener:
+      # Offsets are committed AFTER the database commit. Auto-commit would ack
+      # a record whose delivery_attempt row never landed, which is silent loss.
+      ack-mode: manual
+      concurrency: ${KAFKA_LISTENER_CONCURRENCY:3}
+      observation-enabled: true
+      # A poison message must never block a partition: 3 in-place attempts,
+      # then DLQ with full context, then COMMIT the offset.
+      missing-topics-fatal: true
+
+  threads:
+    virtual:
+      enabled: true
+
+  # 60 s. A worker mid-provider-call must be allowed to finish and commit;
+  # killing it produces an UNKNOWN attempt that the reconciler then has to
+  # chase. This is also why workers are safe on 70% spot instances — eviction
+  # is just another instance of the failure model already handled.
+  lifecycle:
+    timeout-per-shutdown-phase: 60s
+
+server:
+  port: ${SERVER_PORT:8082}
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  health:
+    # Readiness is gated on Kafka and the database; liveness deliberately is
+    # not (spec §11).
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+  metrics:
+    tags:
+      application: notification-worker
+    distribution:
+      percentiles-histogram:
+        notification.dispatch.latency: true
+        provider.call.duration: true
+      slo:
+        notification.dispatch.latency: 1s,5s,30s,120s
+        provider.call.duration: 100ms,250ms,500ms,1s,5s
+  tracing:
+    sampling:
+      probability: 1.0
+
+resilience4j:
+  circuitbreaker:
+    configs:
+      provider:
+        sliding-window-type: TIME_BASED
+        sliding-window-size: 60
+        minimum-number-of-calls: 20
+        failure-rate-threshold: 50
+        slow-call-duration-threshold: 3s
+        slow-call-rate-threshold: 60
+        wait-duration-in-open-state: 30s
+        # Jittered per pod. permittedNumberOfCallsInHalfOpenState is PER JVM:
+        # 40 pods that opened at the same instant and wait the same duration
+        # send 400 synchronised probes at a recovering provider — the exact
+        # herd the breaker exists to prevent (spec §22.2).
+        enable-randomized-wait: true
+        randomized-wait-factor: 1.0
+        permitted-number-of-calls-in-half-open-state: 5
+        automatic-transition-from-open-to-half-open-enabled: true
+  timelimiter:
+    configs:
+      provider:
+        # Strictly below the per-record budget. This is the single
+        # highest-leverage setting in the file: an unbounded provider call is
+        # what turns a vendor incident into a rebalance storm.
+        timeout-duration: 8s
+        cancel-running-future: true
+  retry:
+    configs:
+      # In-process retry is NOT the retry engine. Kafka retry tiers own that.
+      # AWS's worked example: five layers x three retries multiplies load on a
+      # failing dependency 243x. Retry lives in exactly one layer.
+      provider:
+        max-attempts: 1
+
+notification:
+  worker:
+    # Per-JVM retry token budget. Four independent designs converge on ~10%:
+    # Google SRE 10%, gRPC retryThrottling ~10%, Envoy 20%, AWS ~22%. Retries
+    # are "selfish" — they can delay recovery by keeping load high long after
+    # the original issue resolved.
+    retry-budget-ratio: 0.10
+    retry-budget-min-per-second: 10
+    # Lag-based scale-out is suppressed while a channel's circuits are OPEN.
+    # Lag is a symptom of the provider being down, not of insufficient consumer
+    # capacity, so scaling on it points more consumers at a recovering
+    # provider (spec §22.3).
+    suppress-scale-out-when-circuit-open: true
+
+  providers:
+    mock:
+      enabled: true
+
+      # Seeded RNG. Deterministic failure injection is what lets a CI job
+      # assert "exactly 3 messages reached the DLQ" instead of "some messages
+      # probably failed", which is not a test. Move this number and every
+      # failure in the suite changes.
+      seed: ${MOCK_SEED:20260831}
+
+      providers:
+
+        # --- SMS: Twilio semantics -------------------------------------------
+        # Twilio offers NO client-side idempotency key, which is what forces
+        # the UNKNOWN path to be real rather than theoretical. SILENT_SUCCESS
+        # carries a heavy weight here for the same reason: the mock ACKs after
+        # our timeout and fires the webhook anyway, and that is the only honest
+        # way to produce AttemptState.UNKNOWN.
+        # Failure codes emulated: 21610 STOP, 21614 not-a-mobile,
+        # 20429 too-many-requests, 30003 unreachable handset.
+        mock-sms-primary:
+          success-rate: 0.965
+          latency:
+            median: 250ms
+            p99: 2500ms
+          failures:
+            - { profile: TRANSIENT_NETWORK,   weight: 28 }
+            - { profile: PROVIDER_5XX,        weight: 18 }
+            - { profile: RATE_LIMITED,        weight: 20 }   # 20429
+            - { profile: INVALID_RECIPIENT,   weight: 12 }   # 21614
+            - { profile: UNSUBSCRIBED,        weight: 8 }    # 21610
+            - { profile: DEVICE_UNREGISTERED, weight: 4 }    # 30003
+            - { profile: SILENT_SUCCESS,      weight: 10 }
+
+        # The failover target. Deliberately healthier and slower: a secondary
+        # that is equally unreliable proves nothing about failover, and one
+        # that is equally fast hides the cost of failing over.
+        mock-sms-secondary:
+          success-rate: 0.985
+          latency:
+            median: 400ms
+            p99: 3500ms
+          failures:
+            - { profile: TRANSIENT_NETWORK, weight: 50 }
+            - { profile: PROVIDER_5XX,      weight: 30 }
+            - { profile: SILENT_SUCCESS,    weight: 20 }
+
+        # --- EMAIL: Amazon SES semantics --------------------------------------
+        # 50-destination bulk with per-destination results, `Throttling`,
+        # Permanent/General bounces and the complaint feedback loop. Bounces
+        # and complaints are ASYNCHRONOUS (SNS), not send-time results, so they
+        # arrive minutes later and must still reach the suppression list --
+        # otherwise sender reputation degrades and every tenant pays for it.
+        mock-email-primary:
+          success-rate: 0.99
+          latency:
+            median: 150ms
+            p99: 1200ms
+          failures:
+            - { profile: TRANSIENT_NETWORK, weight: 30 }
+            - { profile: RATE_LIMITED,      weight: 30 }   # Throttling
+            - { profile: CONTENT_REJECTED,  weight: 15 }   # MessageRejected
+            - { profile: INVALID_RECIPIENT, weight: 12 }
+            - { profile: UNSUBSCRIBED,      weight: 8 }
+            - { profile: QUOTA_EXCEEDED,    weight: 3 }    # AccountSendingPaused
+            - { profile: SILENT_SUCCESS,    weight: 2 }
+
+        mock-email-secondary:
+          success-rate: 0.995
+          latency:
+            median: 220ms
+            p99: 1800ms
+          failures:
+            - { profile: TRANSIENT_NETWORK, weight: 60 }
+            - { profile: RATE_LIMITED,      weight: 30 }
+            - { profile: SILENT_SUCCESS,    weight: 10 }
+
+        # --- PUSH: FCM v1 + APNs semantics ------------------------------------
+        # DEVICE_UNREGISTERED dominates on purpose: dead tokens are the normal
+        # steady state of a push channel, not an incident, and the 410 response
+        # carries the timestamp at which the token went invalid -- without it
+        # you cannot tell a genuinely dead token from one replaced after this
+        # message was queued.
+        #
+        # There is NO batch endpoint. FCM's /batch was deprecated 2023-06-21
+        # and stopped working 2024-06-21; sendEachForMulticast fans out to
+        # individual HTTP/2 requests and 500 is a client-side chunking limit,
+        # not a server batch. The mock reproduces one request per token so
+        # connection-pool sizing is exercised honestly.
+        mock-push-primary:
+          success-rate: 0.96
+          latency:
+            median: 200ms
+            p99: 1600ms
+          failures:
+            - { profile: DEVICE_UNREGISTERED, weight: 45 }  # UNREGISTERED / 404
+            - { profile: TRANSIENT_NETWORK,   weight: 20 }
+            - { profile: RATE_LIMITED,        weight: 15 }  # QUOTA_EXCEEDED / 429
+            - { profile: PROVIDER_5XX,        weight: 12 }  # UNAVAILABLE
+            - { profile: INVALID_RECIPIENT,   weight: 5 }   # INVALID_ARGUMENT
+            - { profile: SILENT_SUCCESS,      weight: 3 }
+
+    # -------------------------------------------------------------------------
+    # Mock webhook emitter.
+    #
+    # Not yet consumed by a @ConfigurationProperties class -- the emitter is
+    # still to be written -- but the numbers belong here rather than as
+    # constants, because each one exists to make a specific defence REAL
+    # instead of assumed:
+    #
+    #   out-of-order 5%  -> the monotonic guard in DeliveryStatus.transitionTo
+    #   duplicate    2%  -> the idempotent receiver
+    #   loss         1%  -> the reconciler; nothing else would ever find these
+    #   delay 2-45 s     -> DELIVERED arriving long after we moved on
+    #
+    # The emitter calls our OWN public endpoint with a correct HMAC, so
+    # signature verification is genuinely exercised rather than bypassed.
+    # -------------------------------------------------------------------------
+    mock-webhook:
+      enabled: true
+      callback-base-url: ${MOCK_WEBHOOK_BASE:http://localhost:8080}
+      hmac-secret: ${MOCK_WEBHOOK_SECRET:local-development-hmac-secret-not-a-real-key}
+      signature-header: X-Notification-Signature
+      timestamp-tolerance: 5m
+      delay:
+        min: 2s
+        max: 45s
+      out-of-order-rate: 0.05
+      duplicate-rate: 0.02
+      loss-rate: 0.01
+
+    # Runtime chaos control, backed by the ChaosState bean. Makes the failover
+    # story demonstrable in thirty seconds instead of describable in ten
+    # minutes:
+    #   POST /admin/v1/mock-providers/mock-sms-primary/chaos
+    #        {"mode":"HARD_DOWN","durationSeconds":120}
+    # See `make demo`.
+    mock-chaos:
+      enabled: true
+      admin-path: /admin/v1/mock-providers
+
+logging:
+  level:
+    root: INFO
+    dev.gaurav.notification: INFO
+    org.apache.kafka.clients.NetworkClient: WARN
+
+---
+spring:
+  config:
+    activate:
+      on-profile: local
+
+  # LOCAL ONLY — see app-api/src/main/resources/application.yml. Fixed
+  # credentials so Prometheus can scrape /actuator/prometheus before
+  # platform-security ships a SecurityFilterChain that permits it.
+  security:
+    user:
+      name: local
+      password: local
+      roles: ACTUATOR
+
+  kafka:
+    listener:
+      # 1 locally, so a breakpoint stops the whole pipeline and message order
+      # in the log is the order things actually happened.
+      concurrency: 1
+
+logging:
+  level:
+    dev.gaurav.notification: DEBUG
+    org.springframework.kafka.listener: INFO
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "*"

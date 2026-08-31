@@ -1,0 +1,35 @@
+# =============================================================================
+# Grafana datasource provisioning.
+#
+# Provisioned from a file rather than clicked in the UI so that a reviewer's
+# Grafana is identical to ours, and so that `make reset` cannot leave a
+# half-configured instance behind. The same file shape is used by AMG.
+# =============================================================================
+
+apiVersion: 1
+
+# Delete-then-create on every start. Without this, editing the file leaves the
+# old datasource behind under the same name and panels silently query the
+# stale one.
+deleteDatasources:
+  - name: Prometheus
+    orgId: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    orgId: 1
+    uid: prometheus
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # Must match Prometheus's own scrape_interval. If Grafana thinks the
+      # interval is longer than it is, $__rate_interval is computed too wide
+      # and short spikes -- exactly the ones that page -- are averaged away.
+      timeInterval: 15s
+      httpMethod: POST
+      prometheusType: Prometheus
+      prometheusVersion: 3.14.0
+      manageAlerts: false

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The embedded broker logs several thousand lines per run, including alarming-looking
+  KafkaStorageException warnings during its own temp-directory teardown. Left at INFO they bury
+  the one stack trace a failing test actually produced.
+-->
+<configuration>
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <logger name="org.apache.kafka" level="ERROR"/>
+    <logger name="kafka" level="ERROR"/>
+    <logger name="org.springframework.kafka" level="WARN"/>
+    <logger name="org.springframework.test" level="WARN"/>
+    <logger name="dev.gaurav.notification" level="DEBUG"/>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+</configuration>
