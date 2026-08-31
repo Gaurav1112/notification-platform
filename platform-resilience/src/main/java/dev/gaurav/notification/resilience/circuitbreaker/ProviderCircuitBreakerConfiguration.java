@@ -109,4 +109,21 @@ public class ProviderCircuitBreakerConfiguration {
         long baseMillis = base.toMillis();
         return Duration.ofMillis(baseMillis + jitterSource.nextLong(baseMillis));
     }
+
+    /**
+     * Publishes {@code provider_circuit_state}. Without this the AllProvidersOpenForChannel alert
+     * and the Grafana circuit panel reference a metric nothing produces, which renders as an empty
+     * panel rather than an error — the failure mode that let the pass-through breaker hide.
+     */
+    @Bean
+    public ProviderCircuitBreakerMetrics providerCircuitBreakerMetrics(
+            io.micrometer.core.instrument.MeterRegistry meters,
+            io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry registry) {
+        var metrics = new ProviderCircuitBreakerMetrics(meters);
+        registry.getEventPublisher().onEntryAdded(metrics::onEntryAddedEvent);
+        registry.getEventPublisher().onEntryRemoved(metrics::onEntryRemovedEvent);
+        registry.getEventPublisher().onEntryReplaced(metrics::onEntryReplacedEvent);
+        metrics.bindExisting(registry);
+        return metrics;
+    }
 }

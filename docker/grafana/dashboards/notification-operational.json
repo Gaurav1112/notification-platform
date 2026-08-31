@@ -133,7 +133,7 @@
       "title": "Outbox — oldest unpublished row age (page at 120 s)",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 7, "w": 6, "x": 18, "y": 14 },
-      "targets": [{ "refId": "A", "expr": "outbox_oldest_age_seconds", "legendFormat": "oldest" }],
+      "targets": [{ "refId": "A", "expr": "scheduler_outbox_oldest_age", "legendFormat": "oldest" }],
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
     },
     {

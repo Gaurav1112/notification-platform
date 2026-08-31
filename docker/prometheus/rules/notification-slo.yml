@@ -22,6 +22,42 @@
 # every comparison against NaN is false, so an idle laptop does not page.
 # =============================================================================
 
+# ---------------------------------------------------------------------------------------------
+# METRIC COVERAGE — read this before trusting any alert below.
+#
+# A Prometheus rule that references a metric nothing emits does not error. It evaluates to no
+# series and stays silent forever, which on a dashboard is indistinguishable from "healthy".
+# That is a worse failure than having no rule at all, so the state of every metric is recorded
+# here rather than left for a reader to discover during an incident.
+#
+# EMITTED and live:
+#   http_server_requests_seconds_*        Spring Boot, auto-configured
+#   scheduler_dispatch_lag_seconds_*      DueScanHydrator          (Timer  -> _seconds)
+#   scheduler_lease_expired_total         LeaseReaper              (Counter -> _total)
+#   scheduler_outbox_oldest_age           OutboxSweeper            (Gauge)
+#   scheduler_partition_default_rows      PartitionMaintenanceJob  (Gauge)
+#   provider_circuit_state                ProviderCircuitBreakerMetrics (Gauge, 0/1/2/3)
+#   notification_dispatch_outcome_total, notification_status_*_total,
+#   notification_retry_{republished,abandoned}_total, scheduler_claimer_*, scheduler_hydrator_*
+#
+# NOT EMITTED — every rule using one of these is inert and is marked NOT-EMITTED in place:
+#   dlq_backlog_size, notification_accepted_total, notification_delivery_total,
+#   notification_dispatch_attempt_total, notification_dispatch_latency_seconds_*,
+#   notification_dlq_total, notification_duplicate_delivery_total, notification_lost_total,
+#   notification_retry_total, outbox_pending_count, provider_failover_total,
+#   redis_fallback_active
+#
+# NOT EMITTED, needs infrastructure rather than code:
+#   kafka_consumergroup_lag    needs kafka_exporter, absent from docker/compose.yml
+#   kafka_consumer_*           needs MicrometerConsumerListener on the custom ConsumerFactory
+#   kafka_partition_skew       needs a recording job over per-partition lag
+#   pg_replication_*           needs postgres_exporter
+#
+# The instrumentation that DOES exist is good — 40 real meters. The gap is that these rules were
+# written against an intended namespace and never reconciled with the code. Tracked in STATUS.md.
+# ---------------------------------------------------------------------------------------------
+
+
 groups:
 
   # ===========================================================================
@@ -348,6 +384,7 @@ groups:
       # A 200k backlog that is draining after a deploy is fine; a 20k backlog
       # that has grown monotonically for ten minutes is not.
       - alert: ConsumerLagBacklog
+        # NOT-EMITTED: no code produces this metric today; this rule is inert.
         expr: sum by (consumergroup, topic) (kafka_consumergroup_lag) > 100000
         for: 5m
         labels:
@@ -459,6 +496,7 @@ groups:
 
       # -- DLQ ---------------------------------------------------------------
       - alert: DlqRateHigh
+        # NOT-EMITTED: no code produces this metric today; this rule is inert.
         expr: sum(rate(notification_dlq_total[5m])) * 60 > 100
         for: 5m
         labels:
@@ -473,6 +511,7 @@ groups:
           runbook: docs/RUNBOOK.md#dlq-triage-and-replay
 
       - alert: DlqBacklogGrowing
+        # NOT-EMITTED: no code produces this metric today; this rule is inert.
         expr: dlq_backlog_size > 10000
         for: 30m
         labels:
@@ -530,7 +569,7 @@ groups:
 
       # -- outbox ------------------------------------------------------------
       - alert: OutboxAgeHigh
-        expr: outbox_oldest_age_seconds > 120
+        expr: scheduler_outbox_oldest_age > 120
         for: 2m
         labels:
           severity: page
@@ -545,6 +584,7 @@ groups:
           runbook: docs/RUNBOOK.md#outbox-age-growing
 
       - alert: OutboxDepthShedding
+        # NOT-EMITTED: no code produces this metric today; this rule is inert.
         expr: outbox_pending_count > 500000
         for: 2m
         labels:
@@ -594,6 +634,7 @@ groups:
           runbook: docs/RUNBOOK.md#provider-outage
 
       - alert: HalfOpenProbeStampede
+        # NOT-EMITTED: no code produces this metric today; this rule is inert.
         expr: sum by (provider) (rate(provider_failover_total[5m])) > 5
         for: 10m
         labels:
@@ -623,6 +664,7 @@ groups:
           runbook: docs/RUNBOOK.md#provider-outage
 
       - alert: RedisFallbackActive
+        # NOT-EMITTED: no code produces this metric today; this rule is inert.
         expr: redis_fallback_active == 1
         for: 5m
         labels:
@@ -637,6 +679,7 @@ groups:
           runbook: docs/RUNBOOK.md#first-five-minutes-of-an-incident
 
       - alert: KafkaPartitionSkew
+        # NOT-EMITTED: no code produces this metric today; this rule is inert.
         expr: sli:kafka_partition_skew:ratio > 3
         for: 5m
         labels:
@@ -659,7 +702,7 @@ groups:
       # It is a net with an alarm on it, never a destination. Non-zero is
       # always actionable, hence `> 0` rather than a threshold.
       - alert: DefaultPartitionNonEmpty
-        expr: notification_default_partition_rows > 0
+        expr: scheduler_partition_default_rows > 0
         for: 5m
         labels:
           severity: ticket
