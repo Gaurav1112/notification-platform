@@ -324,10 +324,15 @@ Things this project states rather than hides:
 - **AWS infrastructure is 1.2% of total cost of ownership** at scale — ~$2.46M/month of provider fees
   against ~$30k of AWS. A 20% SMS→push down-route saves 15× the entire AWS bill. The routing engine
   matters more than broker tuning, and the design says so.
-- **Load-test numbers are measured or absent.** [LOAD-TEST.md](docs/LOAD-TEST.md) ships the harness
-  spec and an **empty** results table. The only two measured numbers in this repository — the 746 vs
-  159 tps scheduler benchmark and the schema verification — are labelled as measured everywhere they
-  appear.
+- **Load-test numbers are measured or absent.** [LOAD-TEST.md](docs/LOAD-TEST.md) ships a harness
+  spec and an **empty** results table. There is no load-test harness in this repository yet, and
+  that document says so rather than implying otherwise.
+- **Reproducible numbers are separated from prototype numbers.** Everything in
+  [Verified, not claimed](#verified-not-claimed) is regenerated from live commands by
+  `./scripts/capture-verification.sh`. The `746 vs 159 tps` scheduler figure is **not** among them:
+  it came from a design-time prototype on a synthetic schema that is not in this repository, and
+  the code it describes cannot currently run because `scheduled_notification` has no migration.
+  Every document that quotes it says so where it appears.
 - **What is unfinished is listed, not implied.** [STATUS.md](docs/STATUS.md).
 
 ## Licence
