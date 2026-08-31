@@ -168,16 +168,29 @@ schema decision, not a bug fix.
 
 Until then: **use `template`, not `content`.**
 
-### Delivery past `QUEUED` has never been observed
+### Delivery end to end — RESOLVED 2026-08-31, was blocked by an empty `notif.provider`
 
-The furthest a notification has been watched go is `QUEUED` (`rank=30`), once, on the template path.
-No `delivery_attempt` row has ever been seen written by a running worker. A provider send, a `SENT`,
-a `DELIVERED`, and the webhook round trip are all **untested end to end**, on any commit.
+This section previously said no `delivery_attempt` row had ever been written by a running worker and
+that the dispatch half was unproven. That was accurate when written, and the cause has since been
+found: `notif.provider` had no rows, so `ProviderIds` threw before any provider call. See
+"`notif.provider` was empty" below.
 
-The components exist and are unit-tested — `AbstractChannelWorker`, `DeliveryAttemptRecorder`,
-`SendResultHandler`, the five mock providers, `MonotonicDeliveryStatusService`. What has not been
-demonstrated is that they are correctly wired to each other at runtime. Treat "the dispatch half
-works" as unproven rather than as broken.
+With `V901` applied, the template path runs end to end. Observed on a running stack:
+
+| | |
+|---|---|
+| `delivery_attempt` rows | **83** — 82 `SUCCEEDED`, 1 `FAILED` (`TRANSIENT_NETWORK`, the mock's injected rate) |
+| `notification_recipient` | **82** `SENT` |
+| Providers exercised | both `mock-email-primary` (59) and `mock-email-secondary` (23) |
+| A single attempt | `SUCCEEDED`, `latencyMs: 340`, `costMicros: 100`, with a provider message id |
+
+`SENT` is where the template path stops, and that is correct rather than incomplete: `DELIVERED`
+arrives on the webhook path, which is still unexercised. A notification therefore sits at
+`IN_PROGRESS` with `pending: 1` after a successful send, which is the "acceptance is not delivery"
+design working, not a stall.
+
+Still unobserved: the webhook round trip, and therefore `DELIVERED` and `BOUNCED` from a provider
+callback.
 
 ### Two decorators are still pass-throughs
 
@@ -192,21 +205,33 @@ Tracing has no implementation at all — see Not started.
 
 The empty stages stay in the chain so the ordering does not move when they are filled in.
 
-### The chaos endpoint cannot be reached, and could not work if it were
+### The chaos endpoint — RESOLVED 2026-08-31
 
-`notification.providers.mock-chaos.enabled: false` in `app-api/src/main/resources/application.yml`,
-and there is **no override in the `local` profile**. `ChaosController` is
-`@ConditionalOnProperty(havingValue = "true")`, so the endpoint returns `404` under every profile.
-`make demo` and the chaos steps in the README describe something that does not run.
+This section previously said the endpoint returned `404` under every profile and could not work even
+if enabled. Both halves were true and both are fixed.
 
-Enabling the flag would not be enough. `ChaosState` is a plain in-JVM `ConcurrentHashMap`,
-`ChaosController` lives only in `app-api`, and `app-worker` does not depend on `app-api` — the class
-is not in the worker jar. With no shared store, an HTTP call to the API cannot affect the providers
-the worker calls. Making the demo real means moving chaos state into Valkey, which is a small piece
-of work and an honest one to name.
+The `local` profile of all three applications now sets `mock-chaos.enabled: true`, and the controller
+moved from `app-api` to `platform-provider` as `ChaosAdminController`, beside the mock adapters and
+`ChaosState`. Because `platform-provider` is on every application's classpath, whichever process
+serves the endpoint is the process whose providers break — which removes the need for a shared store.
 
-Failover itself is not blocked by this: `ChannelProviderRouter` filters open circuits, and
-`CircuitBreakerProvider` now actually opens them.
+The earlier note proposed moving chaos state into Valkey. That is **no longer the plan**. A fault
+injected into one pod's in-process mock is not cluster-wide, and a shared store would make the demo
+claim a blast radius the real system does not have. Co-locating the endpoint with the state is both
+smaller and more truthful. Inject against the worker if you want it to affect delivery:
+
+```
+curl -X POST localhost:9082/admin/v1/mock-providers/mock-email-primary/chaos \
+     -H 'Content-Type: application/json' -d '{"mode":"HARD_DOWN","durationSeconds":120}'
+```
+
+Verified: with the primary `HARD_DOWN`, attempt **1** lands on `mock-email-secondary` and succeeds —
+no failed attempt first, because the router drops the unhealthy provider before selecting. Captured
+in `docs/screenshots/swagger-07-failover-to-secondary.png`.
+
+One consequence worth knowing: `HARD_DOWN` sets `isHealthy()` false, so the provider is never called
+and its **breaker stays CLOSED**. A breaker only opens for a provider that is healthy but failing,
+which is `DEGRADED`. Any claim that `HARD_DOWN` drives a breaker to OPEN is wrong.
 
 ### Preferences, templates and suppression are stand-ins
 
@@ -297,10 +322,13 @@ baking `TESTCONTAINERS_RYUK_DISABLED` into the repo would disable container clea
 The accept half of this platform runs: three applications boot in under nine seconds, Flyway builds a
 139-table schema from empty, `POST /v1/notifications` returns `202` with an id that is really in the
 database, and replaying the idempotency key returns the same bytes while reusing it with a different
-body returns `409`. 406 tests pass without Docker and 444 with it. The dispatch half is built and
-unit-tested but has never been watched work end to end — nothing has been observed past `QUEUED`, and
-a request that uses inline `content` instead of a template is accepted and then dead-lettered because
-the event record has no field to carry the body. Two provider decorators are still pass-throughs, two
+body returns `409`. 406 tests pass without Docker and 444 with it. The dispatch half now runs on the
+`template` path — 83 `delivery_attempt` rows, 82 `SUCCEEDED`, 82 recipients `SENT`, and a verified
+failover to the secondary provider — after `notif.provider` was found to be empty, which had been
+dead-lettering every dispatch before the network call. What remains unobserved is the webhook round
+trip, so `DELIVERED` and `BOUNCED` from a provider callback are untested. A request that uses inline
+`content` instead of a template is still accepted and then dead-lettered because the event record has
+no field to carry the body. Two provider decorators are still pass-throughs, two
 modules are empty packages, deduplication does not survive a second pod, and there is no load test.
 The design decisions this project set out to demonstrate are demonstrable in the code; the end-to-end
 system is not yet demonstrable in a terminal.

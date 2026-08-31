@@ -18,8 +18,9 @@ Progress: **11 modules built** · 301 main + 76 test Java files · **406 tests g
 444 with `-Pintegration` · schema verified on PostgreSQL 18.6 · all three applications boot.
 
 > **Read [STATUS.md](STATUS.md) alongside this.** Two of the six provider decorators are still
-> pass-throughs, a request that sends inline `content` is accepted and then dead-lettered, and
-> nothing has been observed advancing past `QUEUED`. All three are called out in place below. This
+> pass-throughs, and a request that sends inline `content` is accepted and then dead-lettered. Both
+> are called out in place below. The `template` path now runs end to end — 83 delivery attempts, 82
+> succeeded — after `notif.provider` turned out to be empty; that bug is Part 14 material. This
 > document explains what the code *does*, and it says so plainly when the answer is "nothing yet,
 > and here is why the seam exists anyway".
 >

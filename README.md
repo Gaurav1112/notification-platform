@@ -20,13 +20,27 @@ to build or run the stack.
 > empty database. The accept path works: `202` → replay with an identical body returns the same
 > bytes → a reused key with a different body returns `409`.
 >
+> Delivery runs end to end on the `template` path: **83 `delivery_attempt` rows, 82 `SUCCEEDED`,
+> 82 recipients `SENT`**, across both email providers. Break the primary and attempt **1** lands on
+> the secondary — no failed attempt first, because the router drops an unhealthy provider before
+> selecting. Every claim above is a [screenshot of Swagger UI](#screenshots-of-it-running) driven
+> against the running stack.
+>
 > **Does not work, or has never been seen to work:** a request that sends inline `content` instead
 > of a `template` is accepted with a `202` and then dead-lettered, because the Kafka event record
-> has no field to carry the body. Nothing has been observed advancing past `QUEUED` — no provider
-> send, no `delivery_attempt` row, no `SENT`. The chaos endpoint is disabled under every profile,
-> so `make demo` does not run. Two of six provider decorators are still pass-throughs.
+> has no field to carry the body — **this loses work the API said it accepted**, and it is the most
+> serious open defect. The webhook round trip is unexercised, so `DELIVERED` and `BOUNCED` from a
+> provider callback have never been observed; `SENT` is as far as the path has been watched go.
+> `ProviderHealthGate` keys on circuit state while the router excludes on health, so a `HARD_DOWN`
+> outage never pauses the lane. Two of six provider decorators are still pass-throughs.
 > Deduplication is in-memory, so idempotency does not hold across two worker pods. There is no
 > load-test harness.
+>
+> Until 2026-08-31 this block said nothing had been observed past `QUEUED` and that the chaos
+> endpoint was unreachable. Both were true, and both had the same cause: `notif.provider` was empty,
+> so no provider code could be resolved and every dispatch was dead-lettered before the network
+> call — while the health endpoint reported every circuit CLOSED, because a breaker only records
+> calls that happen. [STATUS.md](docs/STATUS.md) records the whole chain.
 >
 > **[STATUS.md](docs/STATUS.md) is the authoritative account** — it is kept accurate deliberately,
 > because a portfolio repository that overstates itself fails the moment someone clones it.
@@ -192,7 +206,7 @@ Kafka topics as the broker reports them, and Prometheus scraping all three appli
 ---
 
 <details>
-<summary>▶︎ &nbsp;<b>Try it yourself</b> — clone, run, and exercise the API (9 steps; step 7 is the one that does not run)</summary>
+<summary>▶︎ &nbsp;<b>Try it yourself</b> — clone, run, and exercise the API end to end (9 steps, all of which run)</summary>
 
 ### Try it yourself
 
@@ -362,23 +376,48 @@ curl http://localhost:8080/v1/providers/health
 Five provider beans across three adapter classes — two each for SMS and email so failover has
 somewhere to go, one for push.
 
-### 7 · The chaos endpoint — does not run today
+### 7 · Break a provider and watch the failover
+
+Aim it at the **worker**, not the API. `ChaosState` is an in-process object read at send time, and
+sending happens in the worker, so a fault injected into the API's copy affects the API's mocks and
+nothing else:
 
 ```bash
-curl -X POST http://localhost:8080/admin/v1/mock-providers/mock-email-primary/chaos \
+curl -X POST http://localhost:9082/admin/v1/mock-providers/mock-email-primary/chaos \
   -H 'Content-Type: application/json' \
   -d '{"mode":"HARD_DOWN","durationSeconds":120}'
 ```
 
-**This returns `404`, under every profile including `local`.** `ChaosController` is
-`@ConditionalOnProperty(name = "notification.providers.mock-chaos.enabled", havingValue = "true")`,
-`application.yml` sets it to `false` in the base document, and there is no `local` override. `make
-demo` therefore does not run either.
+```json
+{"provider":"mock-email-primary","mode":"HARD_DOWN","until":"2026-08-31T17:25:28.266321Z"}
+```
 
-Flipping the flag would not be enough. `ChaosState` is an in-JVM `ConcurrentHashMap`,
-`ChaosController` ships only in `app-api`, and `app-worker` does not depend on `app-api` — the class
-is not in the worker jar. With no shared store, an HTTP call to the API cannot reach the providers
-the worker calls. Making this demo real means moving chaos state into Valkey.
+The response echoes the resolved deadline rather than the duration you asked for, because the window
+is clamped to an hour — ask for two weeks and you should be able to see that you did not get it.
+
+Now send step 3's request again and read the attempts:
+
+```json
+{ "attemptNumber": 1, "provider": "mock-email-secondary", "state": "SUCCEEDED",
+  "latencyMs": 55, "costMicros": 400 }
+```
+
+Attempt **number 1**, on the secondary. There is no failed attempt 1 followed by a retry: the router
+removes an unhealthy provider from the candidate set *before* selecting, so nothing paid for a
+timeout. `costMicros` is 400 against the primary's 100 — failover is not free, which is why the
+primary is preferred while it is healthy.
+
+Clear it with `DELETE` on the same path.
+
+> **`HARD_DOWN` will not drive the circuit breaker to OPEN, and that is correct.** It sets
+> `isHealthy()` false, so the provider is never called, and a breaker only opens for a provider that
+> is healthy but *failing* — which is `DEGRADED`. Any claim that `HARD_DOWN` produces an OPEN
+> circuit is wrong.
+
+Until 2026-08-31 this step returned `404` under every profile: the base document disabled the
+endpoint and no `local` document ever enabled it, despite a comment in both apps claiming otherwise.
+The controller also lived in `app-api`, so even switched on it would have mutated state no sender
+reads. It now lives in `platform-provider` beside the adapters.
 
 What *is* real: `provider_circuit_state` is exported on the **worker's** `/actuator/prometheus`
 (`0` CLOSED, `1` HALF_OPEN, `2` OPEN, `3` FORCED_OPEN), one series per `(provider, channel)`;
@@ -475,9 +514,11 @@ flowchart LR
 Full diagram set: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 <details>
-<summary>▶︎ &nbsp;<b>Documentation</b> — 17 documents and 18 ADRs, with what each covers</summary>
+<summary>▶︎ &nbsp;<b>Documentation</b> — 18 documents and 18 ADRs, with what each covers</summary>
 
 ### Documentation
+
+**Picking this up later?** [`docs/RESUME-HERE.md`](docs/RESUME-HERE.md) is the single starting point: how to run all three processes, the local-development traps, what is proven, what is still broken, and which decisions not to undo.
 
 | Doc | Contents |
 |---|---|
