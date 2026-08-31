@@ -1,0 +1,21 @@
+$ scripts/capture-verification.sh  — repository inventory
+
+main java files    296
+test java files    67
+java lines         31674
+sql lines          510
+maven modules      11
+markdown docs      36
+ADRs               18
+commits            9
+
+$ git log --oneline
+3854627 fix: security defaults, Flyway autoconfig, and the idempotency replay 500
+e0a88a1 feat: implement platform across all 11 modules
+9a19bff docs: add LEARN-FROM-ZERO, a concrete from-scratch teaching document
+1f87dc8 feat(provider): lock the provider SPI contract
+e99adf4 feat(db): baseline schema, verified against PostgreSQL 18.6
+61a7aa6 feat: scaffold 11-module build with domain model and enforcement tests
+6a73f1a docs: add learning path and interview guide
+8686a5f docs: add doc set and correct provider idempotency claims
+043f53b docs: add notification platform design specification

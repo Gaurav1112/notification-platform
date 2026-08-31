@@ -4,6 +4,7 @@ import dev.gaurav.notification.messaging.event.NotificationEvent;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.annotation.EnableKafka;
 import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
 import org.springframework.kafka.core.ConsumerFactory;
 import org.springframework.kafka.listener.CommonErrorHandler;
@@ -31,8 +32,19 @@ import org.springframework.kafka.listener.ContainerProperties;
  *   <li><strong>Observation enabled.</strong> Needed to tell "the consumer is slow" from "the
  *       consumer is idle", which are the two hypotheses at 3 a.m. and look identical without it.</li>
  * </ul>
+ *
+ * <p><strong>{@code @EnableKafka} is declared here and it is not decoration.</strong>
+ * {@code platform-messaging} depends on {@code spring-kafka} directly rather than on Boot's
+ * {@code spring-boot-kafka} auto-configuration module, so nothing else in this application
+ * registers {@code KafkaListenerAnnotationBeanPostProcessor} or the
+ * {@code KafkaListenerEndpointRegistry}. Without it the factories below are built, every
+ * {@code @KafkaListener} in this module is quietly ignored, and {@code ProviderHealthGate} — which
+ * pauses and resumes containers through that registry — cannot be constructed at all. This module
+ * is the only one that consumes, which is why the annotation belongs on this class rather than on
+ * the shared messaging configuration.
  */
 @Configuration(proxyBeanMethods = false)
+@EnableKafka
 public class WorkerListenerConfiguration {
 
     /** Transactional lanes and the control topics: the latency-sensitive work. */
@@ -49,18 +61,28 @@ public class WorkerListenerConfiguration {
     private final int txConcurrency;
     private final int bulkConcurrency;
     private final int retryConcurrency;
+    private final boolean autoStartup;
 
+    /**
+     * @param autoStartup honours {@code spring.kafka.listener.auto-startup}, which Boot's own
+     *                    factory reads and these hand-built ones otherwise would not. Without it
+     *                    the property is documented and inert, and every context that loads this
+     *                    module opens consumer connections — including a test that only wants to
+     *                    know whether the bean graph is complete
+     */
     public WorkerListenerConfiguration(
             ConsumerFactory<String, NotificationEvent> consumerFactory,
             CommonErrorHandler notificationErrorHandler,
             @Value("${notification.worker.concurrency.tx:6}") int txConcurrency,
             @Value("${notification.worker.concurrency.bulk:3}") int bulkConcurrency,
-            @Value("${notification.worker.concurrency.retry:2}") int retryConcurrency) {
+            @Value("${notification.worker.concurrency.retry:2}") int retryConcurrency,
+            @Value("${spring.kafka.listener.auto-startup:true}") boolean autoStartup) {
         this.consumerFactory = consumerFactory;
         this.errorHandler = notificationErrorHandler;
         this.txConcurrency = txConcurrency;
         this.bulkConcurrency = bulkConcurrency;
         this.retryConcurrency = retryConcurrency;
+        this.autoStartup = autoStartup;
     }
 
     @Bean(TRANSACTIONAL_FACTORY)
@@ -92,6 +114,7 @@ public class WorkerListenerConfiguration {
         factory.setConsumerFactory(consumerFactory);
         factory.setCommonErrorHandler(errorHandler);
         factory.setConcurrency(concurrency);
+        factory.setAutoStartup(autoStartup);
         ContainerProperties properties = factory.getContainerProperties();
         properties.setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
         properties.setMicrometerEnabled(true);

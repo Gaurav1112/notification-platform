@@ -9,6 +9,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.stereotype.Component;
 
@@ -63,10 +64,25 @@ public class LeaderElection implements SmartLifecycle {
 
     private volatile boolean running;
 
+    /**
+     * Convenience for a test that does not care about time. Deliberately not the one Spring uses —
+     * see the {@code @Autowired} below.
+     */
     public LeaderElection(LeaderLockStore store, NodeIdentity node, MeterRegistry meters) {
         this(store, node, meters, Clock.systemUTC());
     }
 
+    /**
+     * {@code @Autowired} because this class has two public constructors and Spring will not guess.
+     *
+     * <p>With neither annotated, the container finds no unambiguous candidate, falls back to
+     * looking for a no-arg constructor and fails the context with "No default constructor found" —
+     * a message that points at a constructor nobody wrote rather than at the ambiguity. Marking the
+     * four-argument one also makes the injected {@link Clock} the one the application configured,
+     * so every lease deadline in this class is comparable with every other deadline in the
+     * scheduler and is movable in a test.
+     */
+    @Autowired
     public LeaderElection(LeaderLockStore store, NodeIdentity node, MeterRegistry meters, Clock clock) {
         this.store = store;
         this.node = node;

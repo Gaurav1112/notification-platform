@@ -1,0 +1,62 @@
+── A credentials_ref CHECK physically rejects a pasted API key ──
+
+INSERT with credentials_ref = a real-looking API key:
+ERROR:  new row for relation "provider_configuration" violates check constraint "provider_configuration_secret_ck"
+DETAIL:  Failing row contains (1, 1, null, 100, 100, 1000, null, SK1234567890abcdefTHISISAKEY, null, {}, 1, 0, 5000, t, 2026-08-31 15:31:52.991912+00, 2026-08-31 15:31:52.991912+00, 0).
+
+INSERT with credentials_ref = a mock/ARN reference:
+ accepted_id 
+-------------
+           2
+(1 row)
+
+
+
+── B the monotonic guard, run as the application runs it ──
+
+1. DELIVERED(80) over SENT(60)                     -> expect 1 row
++-----------+
+|  applied  |
++-----------+
+| DELIVERED |
++-----------+
+(1 row)
+
+2. a LATE SENT(60) arriving after DELIVERED        -> expect 0 rows
++---------+
+| applied |
++---------+
++---------+
+(0 rows)
+
+3. a duplicate DELIVERED webhook                   -> expect 0 rows
++---------+
+| applied |
++---------+
++---------+
+(0 rows)
+
+4. BOUNCED(85) after DELIVERED (not terminal)      -> expect 1 row
++---------+
+| applied |
++---------+
+| BOUNCED |
++---------+
+(1 row)
+
+5. anything after BOUNCED (terminal)               -> expect 0 rows
++---------+
+| applied |
++---------+
++---------+
+(0 rows)
+
+
+final state:
++---------+-------------+
+| status  | status_rank |
++---------+-------------+
+| BOUNCED |          85 |
++---------+-------------+
+(1 row)
+

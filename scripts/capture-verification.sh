@@ -15,6 +15,19 @@ ROOT=$(pwd)
 OUT="$ROOT/docs/verification"
 mkdir -p "$OUT"
 
+# Testcontainers 2.x probes /var/run/docker.sock, which does not exist on Rancher
+# Desktop or Colima. Without this the -Pintegration capture fails for an environment
+# reason and the artefact records a red build that is not the code's fault.
+if [ ! -S /var/run/docker.sock ]; then
+  for sock in "$HOME/.rd/docker.sock" "$HOME/.colima/default/docker.sock"; do
+    if [ -S "$sock" ]; then
+      export DOCKER_HOST="unix://$sock"
+      export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock
+      break
+    fi
+  done
+fi
+
 RENDER=1
 [ "${1:-}" = "--text" ] && RENDER=0
 
@@ -74,8 +87,12 @@ SELECT 'tables'              AS object, count(*) FROM information_schema.tables
         WHERE table_schema='notif' AND table_type='BASE TABLE'
 UNION ALL SELECT 'partitioned parents', count(*) FROM pg_class c
         JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='notif' AND c.relkind='p'
-UNION ALL SELECT 'partitions', count(*) FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid
-        JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='notif'
+UNION ALL SELECT 'table partitions', count(*) FROM pg_inherits i
+        JOIN pg_class c ON c.oid=i.inhrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE n.nspname='notif' AND c.relkind IN ('r','p')
+UNION ALL SELECT 'index partitions', count(*) FROM pg_inherits i
+        JOIN pg_class c ON c.oid=i.inhrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE n.nspname='notif' AND c.relkind='i'
 UNION ALL SELECT 'indexes', count(*) FROM pg_indexes WHERE schemaname='notif'
 UNION ALL SELECT 'check constraints', count(*) FROM pg_constraint co
         JOIN pg_namespace n ON n.oid=co.connamespace WHERE n.nspname='notif' AND co.contype='c';
@@ -90,11 +107,11 @@ say "security constraint and monotonic guard"
   docker exec -i "$PG" psql -U postgres -d notification -q <<'SQL' 2>&1
 INSERT INTO notif.provider (code, display_name, channel, vendor)
      VALUES ('mock-sms-primary','Mock SMS','SMS','mock');
-\echo '$ INSERT ... credentials_ref = ''SK1234567890abcdefTHISISAKEY''   -- a real-looking key
+\echo 'INSERT with credentials_ref = a real-looking API key:'
 INSERT INTO notif.provider_configuration (provider_id, credentials_ref, retry_policy_id)
      VALUES (1, 'SK1234567890abcdefTHISISAKEY', 1);
 \echo
-\echo '$ INSERT ... credentials_ref = ''mock:sms-primary''               -- a reference, not a secret
+\echo 'INSERT with credentials_ref = a mock/ARN reference:'
 INSERT INTO notif.provider_configuration (provider_id, credentials_ref, retry_policy_id)
      VALUES (1, 'mock:sms-primary', 1) RETURNING id AS accepted_id;
 SQL

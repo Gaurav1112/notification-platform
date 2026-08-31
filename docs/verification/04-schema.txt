@@ -1,0 +1,15 @@
+$ psql -f V1__baseline.sql          # applied with ON_ERROR_STOP=1
+applied cleanly, no errors
+
++---------------------+-------+
+|       object        | count |
++---------------------+-------+
+| tables              |   120 |
+| partitioned parents |     6 |
+| table partitions    |   107 |
+| index partitions    |     0 |
+| indexes             |   260 |
+| check constraints   |   298 |
++---------------------+-------+
+(6 rows)
+

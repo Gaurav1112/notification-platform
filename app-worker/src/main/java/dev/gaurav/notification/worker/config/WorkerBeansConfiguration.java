@@ -97,9 +97,11 @@ public class WorkerBeansConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    public DecoratedProviders decoratedProviders(ChannelExecutors executors, MeterRegistry meters,
-                                                 SentTokenLog tokenLog, WorkerProperties properties) {
-        return new DecoratedProviders(executors, meters, tokenLog, properties);
+    public DecoratedProviders decoratedProviders(
+            ChannelExecutors executors, MeterRegistry meters,
+            SentTokenLog tokenLog, WorkerProperties properties,
+            dev.gaurav.notification.resilience.circuitbreaker.ProviderCircuitBreakers breakers) {
+        return new DecoratedProviders(executors, meters, tokenLog, properties, breakers);
     }
 
     // ---- placeholders for modules that have not landed yet -------------------------------------

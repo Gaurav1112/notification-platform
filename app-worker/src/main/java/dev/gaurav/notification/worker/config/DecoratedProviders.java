@@ -31,12 +31,15 @@ public class DecoratedProviders {
     private final MeterRegistry meters;
     private final SentTokenLog tokenLog;
     private final WorkerProperties properties;
+    private final dev.gaurav.notification.resilience.circuitbreaker.ProviderCircuitBreakers breakers;
     private final Map<ProviderCode, NotificationProvider> cache = new ConcurrentHashMap<>();
 
     public DecoratedProviders(ChannelExecutors executors,
                               MeterRegistry meters,
                               SentTokenLog tokenLog,
-                              WorkerProperties properties) {
+                              WorkerProperties properties,
+                              dev.gaurav.notification.resilience.circuitbreaker.ProviderCircuitBreakers breakers) {
+        this.breakers = breakers;
         this.executors = executors;
         this.meters = meters;
         this.tokenLog = tokenLog;
@@ -48,7 +51,7 @@ public class DecoratedProviders {
         return cache.computeIfAbsent(adapter.code(), code -> ProviderDecoratorChain.around(adapter)
                 .traced()
                 .metered(meters)
-                .circuitBroken()
+                .circuitBroken(breakers)
                 .rateLimited()
                 .timeout(executors.forChannel(adapter.channel()), properties.providerDeadline())
                 .idempotent(tokenLog)

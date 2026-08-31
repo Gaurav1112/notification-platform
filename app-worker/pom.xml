@@ -28,6 +28,11 @@
 
         <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-actuator</artifactId></dependency>
         <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency>
+        <!-- ApplicationContextSmokeTest loads the whole context; an in-memory database is what
+             lets that run with no Docker daemon. PostgreSQL-specific SQL is verified against a
+             real 18.6 container in platform-persistence under -Pintegration. -->
+        <dependency><groupId>com.h2database</groupId><artifactId>h2</artifactId><scope>test</scope></dependency>
+
     </dependencies>
     <build>
         <plugins>

@@ -1,0 +1,76 @@
+# =============================================================================
+# The `test` profile for app-scheduler. See app-api's copy for why an in-memory
+# database rather than Testcontainers.
+#
+# Every @Scheduled interval is pushed to an hour. The jobs are the module's whole
+# purpose and they are worth testing, but not here: a due-scan against an empty H2
+# schema asserts nothing and floods the output with the failures of a table that
+# does not exist on this dialect. This test is about the bean graph.
+# =============================================================================
+
+spring:
+  datasource:
+    url: jdbc:h2:mem:notification-scheduler;MODE=PostgreSQL;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE;INIT=CREATE SCHEMA IF NOT EXISTS notif
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+  flyway:
+    enabled: false
+
+  kafka:
+    bootstrap-servers: localhost:1
+    listener:
+      auto-startup: false
+
+  data:
+    redis:
+      host: localhost
+      port: 1
+      timeout: 100ms
+      connect-timeout: 100ms
+
+notification:
+  scheduler:
+    hydrator:
+      scan-interval: 1h
+      # Leader election talks to Valkey on every tick. Off here, so the context
+      # test does not depend on a cache being up.
+      leader-election: false
+    claimer:
+      poll-interval: 1h
+      reap-interval: 1h
+    retry:
+      sweep-interval: 1h
+    outbox:
+      sweep-interval: 1h
+    partition:
+      cron: "0 0 3 1 1 *"
+      canary-cron: "0 0 3 1 1 *"
+  providers:
+    mock:
+      enabled: true
+    mock-chaos:
+      enabled: false
+
+logging:
+  level:
+    org.hibernate.tool.schema: error
+    org.apache.kafka: error
+    io.lettuce: error
+    # A fixedDelay job runs once immediately whatever its interval, so the first
+    # tick of the due scan and the shard assignment still fires. Both then fail:
+    # there is no notif.scheduled_notification table in V1__baseline.sql (see
+    # docs/STATUS.md) and there is no Valkey. Neither is what this test is about,
+    # and a page of stack traces under a passing test teaches people to skip the
+    # output. Silenced here and nowhere else.
+    org.springframework.scheduling.support.TaskUtils: "off"

@@ -1,0 +1,61 @@
+# =============================================================================
+# The `test` profile for app-worker. See app-api's copy for why an in-memory
+# database rather than Testcontainers: this checks the bean graph, and that check
+# has to run where there is no Docker daemon or it stops being run at all.
+#
+# The listener containers are held down. A worker whose containers start needs a
+# broker, and then a missing-bean check fails for a reason that has nothing to do
+# with beans -- which is how a useful test gets deleted.
+# =============================================================================
+
+spring:
+  datasource:
+    url: jdbc:h2:mem:notification-worker;MODE=PostgreSQL;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE;INIT=CREATE SCHEMA IF NOT EXISTS notif
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+  flyway:
+    enabled: false
+
+  kafka:
+    bootstrap-servers: localhost:1
+    listener:
+      # Read by WorkerListenerConfiguration's hand-built factories as well as by
+      # Boot's, so no @KafkaListener container opens a connection.
+      auto-startup: false
+
+  data:
+    redis:
+      host: localhost
+      port: 1
+      timeout: 100ms
+      connect-timeout: 100ms
+
+notification:
+  worker:
+    # The two @Scheduled loops in this module poll every 2 s and 200 ms. Pushed
+    # out of the way so the test measures the context and not a health gate
+    # sweeping an empty database.
+    health-gate-interval-ms: 3600000
+    retry-resume-interval-ms: 3600000
+  providers:
+    mock:
+      enabled: true
+    mock-chaos:
+      enabled: false
+
+logging:
+  level:
+    org.hibernate.tool.schema: error
+    org.apache.kafka: error
+    io.lettuce: error

@@ -63,7 +63,7 @@ public final class ProviderDecoratorChain {
         private int dedicatedThreads = -1;
         private int dedicatedQueueDepth = 0;
         private boolean rateLimited;
-        private boolean circuitBroken;
+        private dev.gaurav.notification.resilience.circuitbreaker.ProviderCircuitBreakers breakers;
         private MeterRegistry meterRegistry;
         private boolean traced;
 
@@ -103,8 +103,14 @@ public final class ProviderDecoratorChain {
             return this;
         }
 
-        public Builder circuitBroken() {
-            this.circuitBroken = true;
+        /**
+         * Wraps the chain in a real circuit breaker. Takes the registry rather than a boolean:
+         * the previous signature was {@code circuitBroken()} with no argument, which is exactly
+         * how the decorator ended up as a pass-through with nothing to record into.
+         */
+        public Builder circuitBroken(
+                dev.gaurav.notification.resilience.circuitbreaker.ProviderCircuitBreakers breakers) {
+            this.breakers = java.util.Objects.requireNonNull(breakers, "breakers");
             return this;
         }
 
@@ -119,10 +125,13 @@ public final class ProviderDecoratorChain {
         }
 
         /** Everything the platform expects of a production provider, in the canonical order. */
-        public Builder full(MeterRegistry registry, SentTokenLog tokenLog, Duration ceiling) {
+        public Builder full(MeterRegistry registry,
+                            dev.gaurav.notification.resilience.circuitbreaker.ProviderCircuitBreakers breakers,
+                            SentTokenLog tokenLog,
+                            Duration ceiling) {
             return traced()
                     .metered(registry)
-                    .circuitBroken()
+                    .circuitBroken(breakers)
                     .rateLimited()
                     .timeoutWithDedicatedPool(16, 32, ceiling)
                     .idempotent(tokenLog);
@@ -141,8 +150,8 @@ public final class ProviderDecoratorChain {
             if (rateLimited) {
                 chain = new RateLimitedProvider(chain);
             }
-            if (circuitBroken) {
-                chain = new CircuitBreakerProvider(chain);
+            if (breakers != null) {
+                chain = new CircuitBreakerProvider(chain, breakers);
             }
             if (meterRegistry != null) {
                 chain = new MeteredProvider(chain, meterRegistry);

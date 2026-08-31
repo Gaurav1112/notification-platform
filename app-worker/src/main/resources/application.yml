@@ -200,7 +200,12 @@ resilience4j:
         # send 400 synchronised probes at a recovering provider — the exact
         # herd the breaker exists to prevent (spec §22.2).
         enable-randomized-wait: true
-        randomized-wait-factor: 1.0
+        # 0.99, not 1.0. Resilience4j validates this into [0, 1) and rejects 1.0
+        # outright, so the value that was here failed the context at startup with
+        # "Illegal argument randomizedWaitFactor" -- the whole worker refused to
+        # boot for a jitter setting. 0.99 spreads the probe over [30s, 59.7s),
+        # which is the same defence to within three-tenths of a second.
+        randomized-wait-factor: 0.99
         permitted-number-of-calls-in-half-open-state: 5
         automatic-transition-from-open-to-half-open-enabled: true
   timelimiter:

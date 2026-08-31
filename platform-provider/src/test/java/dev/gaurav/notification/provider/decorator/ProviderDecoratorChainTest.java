@@ -3,6 +3,9 @@ package dev.gaurav.notification.provider.decorator;
 import dev.gaurav.notification.domain.enums.Channel;
 import dev.gaurav.notification.provider.StubProvider;
 import dev.gaurav.notification.provider.spi.NotificationProvider;
+import dev.gaurav.notification.resilience.circuitbreaker.ProviderCircuitBreakers;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -19,6 +22,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class ProviderDecoratorChainTest {
 
+    private static ProviderCircuitBreakers breakers() {
+        var config = CircuitBreakerConfig.ofDefaults();
+        return new ProviderCircuitBreakers(CircuitBreakerRegistry.of(config), config);
+    }
+
     @Test
     @DisplayName("the chain is assembled in the canonical order regardless of the order the builder was called in")
     void orderIsFixedNotCallerChosen() {
@@ -32,7 +40,7 @@ class ProviderDecoratorChainTest {
                 .rateLimited()
                 .traced()
                 .timeoutWithDedicatedPool(2, 4, Duration.ofSeconds(1))
-                .circuitBroken()
+                .circuitBroken(breakers())
                 .metered(registry)
                 .build();
 
@@ -52,7 +60,7 @@ class ProviderDecoratorChainTest {
         // The other way round, the one case the token log exists for — a call cut off mid-flight —
         // would leave nothing behind at all.
         var chain = ProviderDecoratorChain.around(StubProvider.alwaysAccepts("p", Channel.SMS))
-                .full(new SimpleMeterRegistry(), new InMemorySentTokenLog(), Duration.ofSeconds(1))
+                .full(new SimpleMeterRegistry(), breakers(), new InMemorySentTokenLog(), Duration.ofSeconds(1))
                 .build();
 
         var layers = layerNames(chain);
@@ -63,7 +71,7 @@ class ProviderDecoratorChainTest {
     @DisplayName("metrics sit outside the breaker, or an open circuit reports as zero traffic and perfect health")
     void metricsAreOutsideTheBreaker() {
         var chain = ProviderDecoratorChain.around(StubProvider.alwaysAccepts("p", Channel.SMS))
-                .full(new SimpleMeterRegistry(), new InMemorySentTokenLog(), Duration.ofSeconds(1))
+                .full(new SimpleMeterRegistry(), breakers(), new InMemorySentTokenLog(), Duration.ofSeconds(1))
                 .build();
 
         var layers = layerNames(chain);
@@ -86,7 +94,7 @@ class ProviderDecoratorChainTest {
     void identitySurvivesWrapping() {
         var adapter = StubProvider.alwaysAccepts("mock-sms-primary", Channel.SMS);
         var chain = ProviderDecoratorChain.around(adapter)
-                .full(new SimpleMeterRegistry(), new InMemorySentTokenLog(), Duration.ofSeconds(1))
+                .full(new SimpleMeterRegistry(), breakers(), new InMemorySentTokenLog(), Duration.ofSeconds(1))
                 .build();
 
         assertThat(chain.code()).isEqualTo(adapter.code());
