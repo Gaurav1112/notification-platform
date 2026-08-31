@@ -1,0 +1,29 @@
+SCENARIO: the error contract — RFC 9457 application/problem+json
+────────────────────────────────────────────────────────────────────────
+
+1. Missing Idempotency-Key on a request that creates work
+{
+  "detail": "The Idempotency-Key header is required on this endpoint. Use a value your retry logic will reproduce \u2014 a client-generated UUID, or a key derived from your own entity id.",
+  "instance": "/v1/notifications",
+  "properties": {
+    "traceId": "2813d5b5f65948edae2b41bb6d3c6270",
+    "errors": [
+      {
+        "field": "Idempotency-Key",
+        "code": "MISSING_IDEMPOTENCY_KEY"
+      }
+    ]
+  },
+  "status": 400,
+  "title": "Request validation failed",
+  "type": "https://docs.notification-platform.dev/errors/validation-failed"
+}
+HTTP 400
+
+2. Recipient selector inconsistent with its kind
+{"detail":"The request body failed validation; see errors for the offending fields.","instance":"/v1/notifications","properties":{"traceId":"34a2470d18ba41aa957938cf653519f6","errors":[{"field":"recipients.consistentWithKind","code":"ASSERT_TRUE"}]},"status":400,"title":"Request validation failed","type":"https://docs.notification-platform.dev/errors/validation-failed"}
+HTTP 400
+
+3. Unknown notification id  — 404, never 403, because a 403 confirms it exists
+{"detail":"No notification with id '00000000-0000-7000-8000-000000000000'.","instance":"/v1/notifications/00000000-0000-7000-8000-000000000000","properties":{"traceId":"0744da455db64133892437a3e9d61437"},"status":404,"title":"Notification not found","type":"https://docs.notification-platform.dev/errors/notification-not-found"}
+HTTP 404

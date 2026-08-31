@@ -283,10 +283,14 @@ docker compose -f docker/compose.yml up -d
 ```
 
 Single-broker `apache/kafka:4.3.1` in KRaft mode with `RF=1` and reduced partition counts
-(`docker/kafka-topics-local.sh`), plus `kafbat/kafka-ui` on `http://localhost:8081`.
+(`docker/kafka/create-topics.sh`), plus `kafbat/kafka-ui` on `http://localhost:8081`.
 
 > `provectuslabs/kafka-ui` is **abandoned** — last commit 2024-07-26, with an unpatched RCE
 > history. Use `kafbat/kafka-ui` (the maintainer-led fork) or `redpandadata/console`.
 
-Integration tests use Testcontainers 2 with `@ServiceConnection`, so no local broker is needed for
-`./mvnw verify`.
+`KafkaPipelineIntegrationTest` uses **`@EmbeddedKafka`, not Testcontainers** — an in-JVM broker, so
+it needs no Docker daemon and runs in the plain `./mvnw verify`, not under `-Pintegration`. That is
+the reason it is worth having: a broker test excluded from the default build is a broker test nobody
+runs. The two places that genuinely need a container are PostgreSQL
+(`platform-persistence/.../AbstractPostgresTest`) and `app-scheduler`'s
+`ScheduledWorkStoreIntegrationTest`; those are the only Testcontainers users in the repository.

@@ -1,10 +1,10 @@
 ── A credentials_ref CHECK physically rejects a pasted API key ──
 
 INSERT with credentials_ref = a real-looking API key:
-ERROR:  new row for relation "provider_configuration" violates check constraint "provider_configuration_secret_ck"
-DETAIL:  Failing row contains (1, 1, null, 100, 100, 1000, null, SK1234567890abcdefTHISISAKEY, null, {}, 1, 0, 5000, t, 2026-08-31 15:31:52.991912+00, 2026-08-31 15:31:52.991912+00, 0).
 
 INSERT with credentials_ref = a mock/ARN reference:
+ERROR:  new row for relation "provider_configuration" violates check constraint "provider_configuration_secret_ck"
+DETAIL:  Failing row contains (1, 1, null, 100, 100, 1000, null, SK1234567890abcdefTHISISAKEY, null, {}, 1, 0, 5000, t, 2026-08-31 16:49:27.870572+00, 2026-08-31 16:49:27.870572+00, 0).
  accepted_id 
 -------------
            2

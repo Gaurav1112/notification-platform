@@ -1,0 +1,98 @@
+SCENARIO: circuit breaker opens under failure and the router fails over
+────────────────────────────────────────────────────────────────────────
+
+1. Baseline — every circuit CLOSED
+$ curl -X GET http://localhost:9080/v1/providers/health
+{
+    "providers": [
+        {
+            "code": "mock-email-primary",
+            "channel": "EMAIL",
+            "circuitState": "CLOSED",
+            "healthy": true,
+            "successRate5m": 1.0,
+            "p95LatencyMs": 0.0,
+            "rateLimitUtilization": 0.0
+        },
+        {
+            "code": "mock-email-secondary",
+            "channel": "EMAIL",
+            "circuitState": "CLOSED",
+            "healthy": true,
+            "successRate5m": 1.0,
+            "p95LatencyMs": 0.0,
+            "rateLimitUtilization": 0.0
+        },
+        {
+            "code": "mock-push-primary",
+            "channel": "PUSH",
+            "circuitState": "CLOSED",
+            "healthy": true,
+            "successRate5m": 1.0,
+            "p95LatencyMs": 0.0,
+            "rateLimitUtilization": 0.0
+        },
+        {
+            "code": "mock-sms-primary",
+            "channel": "SMS",
+            "circuitState": "CLOSED",
+            "healthy": true,
+            "successRate5m": 1.0,
+            "p95LatencyMs": 0.0,
+            "rateLimitUtilization": 0.0
+        },
+        {
+            "code": "mock-sms-secondary",
+
+2. Break the primary email provider
+$ curl -X POST http://localhost:9080/admin/v1/mock-providers/mock-email-primary/chaos
+{"detail":"No resource at this path.","instance":"/admin/v1/mock-providers/mock-email-primary/chaos","properties":{"traceId":"04684440f5524c2cbc1cb0dbd24236b3"},"status":404,"title":"Notification not found","type":"https://docs.notification-platform.dev/errors/notification-not-found"}
+HTTP 404
+
+3. Drive traffic through the broken provider
+   30 requests sent
+
+4. Provider health after the failures
+{
+    "providers": [
+        {
+            "code": "mock-email-primary",
+            "channel": "EMAIL",
+            "circuitState": "CLOSED",
+            "healthy": true,
+            "successRate5m": 1.0,
+            "p95LatencyMs": 0.0,
+            "rateLimitUtilization": 0.0
+        },
+        {
+            "code": "mock-email-secondary",
+            "channel": "EMAIL",
+            "circuitState": "CLOSED",
+            "healthy": true,
+            "successRate5m": 1.0,
+            "p95LatencyMs": 0.0,
+            "rateLimitUtilization": 0.0
+        },
+        {
+            "code": "mock-push-primary",
+            "channel": "PUSH",
+            "circuitState": "CLOSED",
+            "healthy": true,
+            "successRate5m": 1.0,
+            "p95LatencyMs": 0.0,
+            "rateLimitUtilization": 0.0
+        },
+        {
+            "code": "mock-sms-primary",
+            "channel": "SMS",
+            "circuitState": "CLOSED",
+            "healthy": true,
+            "successRate5m": 1.0,
+            "p95LatencyMs": 0.0,
+            "rateLimitUtilization": 0.0
+        },
+        {
+            "code": "mock-sms-secondary",
+
+5. Restore
+   chaos cleared

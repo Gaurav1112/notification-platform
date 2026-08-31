@@ -1,0 +1,52 @@
+SCENARIO: the durable record behind those requests
+────────────────────────────────────────────────────────────────────────
+
+$ psql -d notification
+Row counts
++---------------+------------+---------------------+--------------------+-------------------+
+| notifications | recipients | idempotency_records | unpublished_outbox | delivery_attempts |
++---------------+------------+---------------------+--------------------+-------------------+
+|            70 |          4 |                  70 |                 38 |                 0 |
++---------------+------------+---------------------+--------------------+-------------------+
+(1 row)
+
+
+The outbox is empty because the sweeper published and DELETED each row.
+Rows are deleted, never marked published, so the table cannot grow without bound.
+
+Most recent notifications
++--------------------------------------+---------+---------+-------------+
+|                  id                  | channel | status  | status_rank |
++--------------------------------------+---------+---------+-------------+
+| cbb13972-4fe4-4d85-900e-8e9753d41eaa | EMAIL   | PENDING |          10 |
+| 0dfd48a4-829a-47e5-a8da-a665a317f22e | EMAIL   | PENDING |          10 |
+| 6a2a7058-c720-4268-b1f0-e34da58dfd50 | EMAIL   | PENDING |          10 |
+| a69bb004-c557-4bbe-b5ff-8bd4b4ab4d8a | EMAIL   | PENDING |          10 |
+| f807c2fe-cfcd-4378-89e8-b045362c3fac | EMAIL   | PENDING |          10 |
++--------------------------------------+---------+---------+-------------+
+(5 rows)
+
+
+The status vocabulary is a TABLE, not an enum — rank and is_terminal are data the SQL joins on
++-------------+------+-------------+------------+
+|    code     | rank | is_terminal | is_failure |
++-------------+------+-------------+------------+
+| PENDING     |   10 | f           | f          |
+| SCHEDULED   |   20 | f           | f          |
+| SUPPRESSED  |   25 | t           | t          |
+| EXPIRED     |   27 | t           | t          |
+| CANCELLED   |   28 | t           | t          |
+| QUEUED      |   30 | f           | f          |
+| CLAIMED     |   40 | f           | f          |
+| SENDING     |   50 | f           | f          |
+| SEND_FAILED |   55 | f           | t          |
+| FAILED      |   58 | t           | t          |
+| SENT        |   60 | f           | f          |
+| ACCEPTED    |   70 | f           | f          |
+| DELIVERED   |   80 | f           | f          |
+| BOUNCED     |   85 | t           | t          |
+| COMPLAINED  |   88 | t           | t          |
+| UNKNOWN     |   90 | f           | f          |
++-------------+------+-------------+------------+
+(16 rows)
+

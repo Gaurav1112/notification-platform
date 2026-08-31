@@ -111,8 +111,13 @@ Q1  with a created_at bound:     Index Scan, 7 buffers, 0.476 ms
 Q1b without a created_at bound:  Append across ALL 90 partitions
 ```
 
-An ArchUnit test fails the build on any repository method against `Notification` that lacks a
-`created_at` bound. There is no way to recover this later.
+**Not enforced by a test yet.** The convention is applied by hand — see `PartitionWindows` and
+`RequestFanOut`, which both compute an explicit window before querying `notification` — but nothing
+fails the build on a repository method that omits the bound. The reflective test that *does* exist,
+`platform-persistence/src/test/java/.../TenantScopedQueryArchTest.java`, reads every `@Query` and
+fails the build on a missing **tenant** predicate; a `created_at`-bound rule would be a second
+predicate check in the same file, and it has not been written. Until it is, an unbounded finder
+compiles, passes, and quietly appends across all 90 partitions.
 
 PostgreSQL 18 has native `uuidv7()`; Spring Boot 4.1.1 ships Hibernate 7 with
 `@UuidGenerator(style = VERSION_7)`. **IDs are generated in Java, not by the column DEFAULT** —
@@ -304,8 +309,14 @@ SET statement_timeout = '0';
 
 so DDL that can't get its lock fails fast instead of queueing and blocking every writer behind it.
 
-**CI gate:** run each migration against a Testcontainers PG 18.6 seeded with 10M rows; fail the
-build if any statement holds `ACCESS EXCLUSIVE` for more than 1 s.
+**CI gate — designed, not built.** The intended gate is: run each migration against a PG 18.6
+container seeded with 10M rows and fail the build if any statement holds `ACCESS EXCLUSIVE` for more
+than 1 s. That is not what [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) does. Its
+`schema` job applies `V1__baseline.sql` to an **empty** PostgreSQL 18.6 service container with
+`ON_ERROR_STOP=1` and then asserts the object counts this document quotes — it proves the migration
+is syntactically clean and produces the schema described here, and it measures no lock duration at
+all. On an empty table every one of these statements is instant, so the job cannot fail for the
+reason the gate exists.
 
 ### Adding a NOT NULL column — the PG 18 trap
 

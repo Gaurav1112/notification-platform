@@ -16,6 +16,9 @@ import dev.gaurav.notification.api.port.ApiCaller;
 import dev.gaurav.notification.api.port.NotificationCommandPort;
 import dev.gaurav.notification.api.port.NotificationQueryPort;
 import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.enums.ParameterIn;
+import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
@@ -82,7 +85,24 @@ public class NotificationController {
     @PostMapping
     @Idempotent
     @Operation(summary = "Send a notification",
-            description = "Requires an Idempotency-Key header. Returns 202; delivery has not happened yet.")
+            description = "Requires an Idempotency-Key header. Returns 202; delivery has not happened yet.",
+            // Declared explicitly because the handler does not take it as a method parameter: the
+            // key is claimed by IdempotencyKeyInterceptor before the controller runs and handed
+            // over as a request attribute, so springdoc has nothing to infer it from. Without this
+            // the header was described in prose and absent from the document, which meant Swagger
+            // UI offered no field for it and every "Try it out" on the one endpoint that creates
+            // work came back 400. A required header that only the prose knows about is not a
+            // contract.
+            parameters = @Parameter(
+                    in = ParameterIn.HEADER,
+                    name = "Idempotency-Key",
+                    required = true,
+                    description = """
+                            Caller-generated key that makes this request replayable. Repeating it \
+                            with the same body replays the original response byte for byte and \
+                            creates nothing; repeating it with a different body is a 409.""",
+                    schema = @Schema(type = "string", maxLength = 255,
+                            example = "order-4821-shipped-notification")))
     public ResponseEntity<AcceptResponse> send(ApiCaller caller,
                                                @Valid @RequestBody SendNotificationRequest request,
                                                HttpServletRequest servletRequest) {

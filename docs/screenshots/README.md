@@ -1,38 +1,51 @@
-# Screenshots of the running system
+# Screenshots
 
-Captured from a live local stack, not mocked up. Reproduce with:
+Captured from a running system: `app-api` on `:9080`, `app-worker` on `:9082`, `app-scheduler` on
+`:9081`, with PostgreSQL 18.6, Kafka 4.3.1, Valkey 9.1.1, Prometheus and Grafana in Docker.
 
-```bash
-make up                                        # postgres, valkey, kafka, prometheus, grafana
-./mvnw -pl app-api       spring-boot:run -Dspring-boot.run.arguments=--server.port=9080
-./mvnw -pl app-worker    spring-boot:run -Dspring-boot.run.arguments=--server.port=9082
-./mvnw -pl app-scheduler spring-boot:run -Dspring-boot.run.arguments=--server.port=9083
-```
-
-Alternate ports are used so the capture does not collide with an already-running stack.
+The Swagger captures were taken by driving the real UI — filling the parameter fields, clicking
+**Execute**, and screenshotting whatever came back. Each one therefore shows the `curl` equivalent,
+the request URL and the server's actual response including headers. None of them is a mockup, and
+none is a response pasted into a template.
 
 | File | What it shows |
 |---|---|
-| `01-swagger-ui.png` | The generated OpenAPI surface — every endpoint in `docs/API.md`, live |
-| `02-kafka-topics.png` | All 16 topics with real message counts and partition counts |
-| `03-prometheus-targets.png` | Scrape targets |
-| `04-prometheus.png` | Prometheus query surface |
-| `05-health.png` | `/actuator/health` with the database and Valkey components |
+| `swagger-00-api-overview.png` | The full API surface: eight endpoints under three tags, plus the local-only chaos controller |
+| `swagger-01-accept-202.png` | `POST /v1/notifications` → `202` with a `Location` header |
+| `swagger-02-idempotent-replay.png` | Same key, same body → identical `202`, including the original `acceptedAt` |
+| `swagger-03-fingerprint-mismatch-409.png` | Same key, different body → `409 FINGERPRINT_MISMATCH` as `application/problem+json` |
+| `swagger-04-delivery-attempts.png` | A real `SUCCEEDED` attempt through `mock-email-primary`, with provider message id and latency |
+| `swagger-05-provider-health.png` | Five providers, three channels, circuit state and success rate per provider |
+| `swagger-06-chaos-injection.png` | `HARD_DOWN` injected into a mock provider; the response echoes the clamped deadline |
+| `swagger-07-failover-to-secondary.png` | With the primary broken, **attempt 1** lands on `mock-email-secondary` — no failed attempt first |
+| `09-actuator-health.png` | `/actuator/health`: PostgreSQL and Valkey UP, liveness and readiness groups |
+| `02-kafka-topics.png` | Topics and partition counts as the broker reports them |
+| `03-prometheus-targets.png` | Prometheus scraping all three applications |
+| `04-prometheus.png` | A platform metric queried in Prometheus |
 
-## What `02-kafka-topics.png` actually shows, including the bad news
+## Reproducing them
 
-The topic list is the design made concrete: `dispatch.{sms,email,push}.{tx,bulk}` as six physically
-separate topics rather than one topic with a priority field, and the five retry tiers
-(`5s · 30s · 2m · 10m · 1h`). Partition counts differ per topic because they are derived from
-measured consumer throughput, not chosen uniformly — see `docs/KAFKA.md`.
+```bash
+docker compose -f docker/compose.yml up -d
+./mvnw -pl app-api       spring-boot:run -Dspring-boot.run.arguments=--server.port=9080 &
+./mvnw -pl app-worker    spring-boot:run -Dspring-boot.run.arguments=--server.port=9082 &
+./mvnw -pl app-scheduler spring-boot:run -Dspring-boot.run.arguments=--server.port=9081 &
+open http://localhost:9080/swagger-ui/index.html
+```
 
-It also shows **75 messages in `notification.dlq`**, and that is left in deliberately.
+All three processes are required. The API accepts and writes the outbox row; the **scheduler** owns
+the outbox sweeper that publishes it; the **worker** consumes the dispatch topics and calls the
+providers. Start only the API and every request will return `202` and then sit at `PENDING`
+forever, which looks like a hung platform and is really a missing process.
 
-Those are inline-content requests (`"content": {...}` instead of `"template": {...}`). They fail
-at fan-out because `NotificationRequestedEvent` carries a template reference and has no field for
-inline content, so the renderer throws on a null template code. The retry ladder ran, the attempts
-were exhausted, and the messages landed in the dead-letter queue rather than being silently
-dropped — which is the behaviour the design promises.
+Inject chaos against the process whose providers you want to break — the worker, if you want it to
+affect delivery:
 
-Template-based requests complete the full pipeline: accept → outbox → Kafka → fan-out → recipient
-row. Inline content is tracked in [STATUS.md](../STATUS.md).
+```bash
+curl -X POST localhost:9082/admin/v1/mock-providers/mock-email-primary/chaos \
+     -H 'Content-Type: application/json' -d '{"mode":"HARD_DOWN","durationSeconds":120}'
+```
+
+Terminal captures of the build, the schema and the behaviour tests live in
+[`../verification/`](../verification/) and are regenerated by `./scripts/capture-verification.sh`
+and `./scripts/capture-scenarios.sh`.

@@ -1,4 +1,4 @@
-package dev.gaurav.notification.api.dto;
+package dev.gaurav.notification.provider.mock.admin;
 
 import dev.gaurav.notification.provider.mock.ChaosState;
 

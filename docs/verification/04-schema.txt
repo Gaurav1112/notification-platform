@@ -7,7 +7,7 @@ applied cleanly, no errors
 | tables              |   120 |
 | partitioned parents |     6 |
 | table partitions    |   107 |
-| index partitions    |     0 |
+| index partitions    |   228 |
 | indexes             |   260 |
 | check constraints   |   298 |
 +---------------------+-------+

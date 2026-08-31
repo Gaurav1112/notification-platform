@@ -1,0 +1,64 @@
+SCENARIO: accept, idempotent replay, and fingerprint mismatch
+────────────────────────────────────────────────────────────────────────
+
+1. First request
+$ curl -X POST http://localhost:9080/v1/notifications  -H 'Idempotency-Key: scenario-1788195289'
+HTTP 202
+{
+    "notificationRequestId": "98424de2-0f71-4f2f-a92a-d9d09d28162b",
+    "status": "ACCEPTED",
+    "acceptedAt": "2026-08-31T16:54:49.186919Z",
+    "recipientCount": 1,
+    "notifications": [
+        {
+            "id": "121fef69-896b-4c60-806d-cdd7abff6cbe",
+            "channel": "EMAIL",
+            "status": "ACCEPTED"
+        }
+    ],
+    "links": {
+        "status": "/v1/notifications/121fef69-896b-4c60-806d-cdd7abff6cbe"
+    }
+}
+
+2. SAME key, SAME body   — must replay, must NOT create anything
+HTTP 202
+{
+    "notificationRequestId": "98424de2-0f71-4f2f-a92a-d9d09d28162b",
+    "status": "ACCEPTED",
+    "acceptedAt": "2026-08-31T16:54:49.186919Z",
+    "recipientCount": 1,
+    "notifications": [
+        {
+            "id": "121fef69-896b-4c60-806d-cdd7abff6cbe",
+            "channel": "EMAIL",
+            "status": "ACCEPTED"
+        }
+    ],
+    "links": {
+        "status": "/v1/notifications/121fef69-896b-4c60-806d-cdd7abff6cbe"
+    }
+}
+
+==> RESPONSES ARE BYTE-IDENTICAL. The retry cannot tell it was second.
+
+3. SAME key, DIFFERENT body   — must be 409, not a silent replay
+HTTP 409
+{
+    "detail": "Key 'scenario-1788195289' was used at 2026-08-31T16:54:49.307195Z with a different body.",
+    "instance": "/v1/notifications",
+    "properties": {
+        "traceId": "60838061c23b4df1bc6d7bdb86651cd1",
+        "errors": [
+            {
+                "field": "Idempotency-Key",
+                "code": "FINGERPRINT_MISMATCH"
+            }
+        ]
+    },
+    "status": 409,
+    "title": "Idempotency key reused with a different payload",
+    "type": "https://docs.notification-platform.dev/errors/idempotency-key-reused"
+}
+
+notification id for the next scenario: 121fef69-896b-4c60-806d-cdd7abff6cbe

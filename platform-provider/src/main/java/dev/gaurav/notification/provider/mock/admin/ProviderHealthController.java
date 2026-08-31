@@ -1,7 +1,6 @@
-package dev.gaurav.notification.api.rest;
+package dev.gaurav.notification.provider.mock.admin;
 
-import dev.gaurav.notification.api.dto.ProviderHealthResponse.ProviderHealth;
-import dev.gaurav.notification.api.dto.ProviderHealthResponse;
+import dev.gaurav.notification.provider.mock.admin.ProviderHealthResponse.ProviderHealth;
 import dev.gaurav.notification.domain.enums.Channel;
 import dev.gaurav.notification.domain.enums.CircuitState;
 import dev.gaurav.notification.provider.decorator.MeteredProvider;
@@ -14,6 +13,7 @@ import io.micrometer.core.instrument.search.Search;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -38,6 +38,17 @@ import java.util.concurrent.TimeUnit;
  * open the circuit fleet-wide. Two replicas can therefore legitimately disagree, which is documented
  * on the response type rather than smoothed over here.
  *
+ * <p><strong>Why this class sits in {@code platform-provider} and not in {@code app-api}.</strong>
+ * Everything it reads -- the Resilience4j registry, the {@code notification.provider.send} timer,
+ * {@link NotificationProvider#isHealthy()} -- is per-JVM state written by the send path. It was
+ * originally hosted only by the API tier, which routes no traffic, so it reported the same
+ * unchanging answer forever: every circuit CLOSED, every success rate 1.0, every p95 exactly 0.0.
+ * That last number is the tell -- a provider that has genuinely never been slow still records a
+ * latency once it has been called at all. Packaged with the providers, the endpoint is served by
+ * whichever process owns the breakers it describes, so the worker's copy reports the worker's
+ * sends. The API tier still exposes it, and still reports all-CLOSED, which is now the truth about
+ * that process rather than an artefact of where the file lived.
+ *
  * <p><strong>{@code successRate5m} is cumulative, not a true five-minute window.</strong> A rolling
  * window needs a step registry or a Prometheus range query; the honest short-term answer is the
  * lifetime ratio, and the honest place for the windowed one is the recording rule in
@@ -46,6 +57,7 @@ import java.util.concurrent.TimeUnit;
  */
 @RestController
 @RequestMapping("/v1/providers")
+@ConditionalOnWebApplication
 @Tag(name = "Providers", description = "Provider health and circuit state, as this pod sees it")
 public class ProviderHealthController {
 

@@ -1,16 +1,21 @@
 # Load Testing
 
-The harness, the scenarios, how to run them, and an **empty results table**.
+**A specification for a load-test harness that does not exist yet.** Nothing in this document is
+runnable today.
 
-> **No benchmark numbers are published in this repository, because the tests have not been run.**
+> **There is no load-test harness in this repository, and no benchmark numbers.**
 >
-> The `load-test/` directory does not exist yet. This document is the specification for it: the
-> scenarios, the exact commands, the hardware to record, and the table those runs will fill in.
-> Everything below the "Results" heading is blank on purpose and will stay blank until real runs
-> produce real numbers.
+> `load-test/` does not exist. There is no k6 script, no Gatling simulation, no `make load` target
+> and no recorded run. The commands quoted below are what the harness *will* be invoked with once it
+> is written; typing them today gets you `command not found` or `no such file`.
 >
-> The two measurements this project *does* have are listed in
-> [STATUS.md](STATUS.md#measurements) and are labelled as measured everywhere they appear.
+> What this document *is*: the scenario list, the thresholds each scenario should gate on, the
+> hardware facts to record alongside a run, and the empty table those runs will fill in. Writing the
+> scenarios down before running them is the useful half — it fixes what "pass" means before anyone
+> has a number they would like to be true.
+>
+> The measurements this project *does* have are listed in
+> [STATUS.md](STATUS.md#measurements) and are labelled everywhere they appear.
 
 ---
 
@@ -20,12 +25,14 @@ A systems-design project that publishes invented throughput figures is worse tha
 none. The figures are unfalsifiable, they will be wrong, and the first interviewer who asks "what was
 the p99 at 2,000 RPS and what was the bottleneck?" gets an answer that unravels.
 
-So: the harness ships, the commands ship, the hardware spec ships, and the numbers arrive when they
-are earned.
+So the scenarios and the thresholds are written down, the hardware facts to capture are listed, and
+the numbers arrive when they are earned. The harness itself is unwritten work, listed as such in
+[STATUS.md](STATUS.md#not-started).
 
-**Say in an interview:** *"The load-test doc has an empty results table. I'd rather say 'I haven't run
-it' than publish a number I made up — and the two numbers I do quote, the scheduler claim benchmark
-and the schema verification, I ran against real Postgres and I can tell you exactly how."*
+**Say in an interview:** *"The load-test doc is a spec with an empty results table, and the harness
+isn't written. I'd rather say 'I haven't run it' than publish a number I made up — and the one
+throughput figure I do quote, the scheduler claim benchmark, came from a design-time prototype on a
+synthetic schema, not from this repository, and every document that quotes it says so."*
 
 ---
 
@@ -42,9 +49,10 @@ host JVMs              app-api :8080 · app-worker · app-scheduler
 The apps run on the host rather than in containers so a profiler and a debugger attach directly and a
 recompile is instant. Prometheus reaches them via `host.docker.internal`.
 
-> **Blocker:** `app-api` cannot boot today — its three inbound ports have no adapters
-> ([STATUS.md](STATUS.md#app-api-cannot-boot)). No load test can run end to end until that is closed.
-> The scenarios below are written against the intended surface.
+All three applications boot and the accept path works, so a load test of **accept** could be written
+against the surface as it stands today. A load test of **delivery** could not: nothing has yet been
+observed advancing past `QUEUED`, so a throughput number for the dispatch half would be measuring a
+pipeline whose end has never been seen to work. See [STATUS.md](STATUS.md#partial).
 
 ---
 
@@ -121,7 +129,7 @@ make build
 # 4. Wait for readiness
 make wait
 
-# 5. A scenario
+# 5. A scenario — NONE OF THESE FILES EXIST YET
 k6 run load-test/k6/baseline.js
 k6 run load-test/k6/mixed-class.js
 k6 run --out experimental-prometheus-rw load-test/k6/ramp.js
@@ -252,7 +260,7 @@ Things that will produce a wrong number if you do not control for them.
 | **JIT warm-up** | First 30–60 s is 2–5× slower | Discard the first minute of every run |
 | **`Sleeper.REAL` in the mocks** | Mock providers really do sleep — log-normal latency with a real tail | Intended. Do **not** switch to `Sleeper.NONE`: it removes the tail the whole design is shaped around |
 | **Deterministic failure injection** | Failure rate is a pure function of message identity, so it is stable across runs | Good for reproducibility. It also means a *different* recipient-ID generator changes your failure rate |
-| **Flyway on first start** | The V1 migration creates 335 partitions | Let it finish before starting the clock |
+| **Flyway on first start** | The migrations create 125 table partitions across 7 partitioned parents | Let it finish before starting the clock — it takes ~150 ms, but it happens inside `app-api` boot |
 | **Partition pre-creation** | A run crossing midnight needs tomorrow's partitions | `PartitionMaintenanceJob` handles it; verify before a soak |
 | **`InMemorySentTokenLog` bounds** | 100k entries, 1 h TTL — a long soak evicts | Watch `evictions()`; a non-zero value means the TTL is too generous for the run |
 | **Kafka retention during a soak** | Two hours of retry-tier traffic is real volume | Check disk before, not after |
@@ -261,11 +269,15 @@ Things that will produce a wrong number if you do not control for them.
 
 ## Prerequisites for the harness to be buildable
 
-Listed so the gap is explicit:
+Listed so the gap is explicit. Item 1 is done; 2 through 5 are not, and until they are, this whole
+document is a plan.
 
-1. **`app-api` must boot** — the three inbound ports need adapters.
-2. **A seeded tenant and credential** so k6 can authenticate, or a documented dev bypass.
-3. **`load-test/k6/*.js`** — six scenario files.
+1. ~~**`app-api` must boot**~~ — done. All three applications start; see
+   [STATUS.md](STATUS.md#runtime-state).
+2. **A seeded tenant and credential** so k6 can authenticate, or a documented dev bypass. `V900`
+   seeds a local development tenant under the `local` profile, which covers the local case and not a
+   packaged one.
+3. **`load-test/k6/*.js`** — six scenario files. None written.
 4. **A recipient generator** that produces realistic address distributions; because failure injection
    is seeded on recipient ID, a degenerate generator produces a degenerate failure rate.
 5. **A results-capture script** that pulls the Prometheus series listed above at the end of a run, so

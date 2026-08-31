@@ -8,6 +8,7 @@ import io.swagger.v3.oas.models.info.License;
 import io.swagger.v3.oas.models.security.SecurityRequirement;
 import io.swagger.v3.oas.models.security.SecurityScheme;
 import io.swagger.v3.oas.models.servers.Server;
+import org.springdoc.core.utils.SpringDocUtils;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -27,6 +28,19 @@ import java.util.List;
  */
 @Configuration
 public class OpenApiConfig {
+
+    static {
+        // ApiCaller is supplied by ApiCallerArgumentResolver from the authenticated principal, not
+        // by the client. springdoc cannot know that: it sees a handler parameter it does not
+        // recognise and documents it as a required field named "caller", which rendered in Swagger
+        // UI as a mandatory input with no way to fill it in. A reader's reasonable conclusion is
+        // that the endpoint cannot be called from the UI, which was very nearly true -- see the
+        // Idempotency-Key parameter on NotificationController#send, missing for the opposite
+        // reason. Registering the type as ignored is the documented fix and keeps the signature
+        // honest; the alternative, @Parameter(hidden = true) on every occurrence, is one new
+        // controller away from regressing.
+        SpringDocUtils.getConfig().addRequestWrapperToIgnore(dev.gaurav.notification.api.port.ApiCaller.class);
+    }
 
     @Bean
     public OpenAPI notificationPlatformOpenApi() {
@@ -59,9 +73,20 @@ public class OpenApiConfig {
                                 Errors are RFC 9457 `application/problem+json`; branch on the `type` URI, \
                                 never on the English `title`.""")
                         .contact(new Contact().name("Notification Platform").email("platform@notification-platform.dev"))
-                        .license(new License().name("Proprietary")))
+                        // Matches the LICENSE file at the repository root. These disagreed: the document
+                        // said Proprietary while the repository shipped MIT, and the licence a
+                        // consumer sees in the API contract is the one they will act on.
+                        .license(new License().name("MIT")
+                                .url("https://github.com/Gaurav1112/notification-platform/blob/main/LICENSE")))
                 .servers(List.of(
-                        new Server().url("http://localhost:8080").description("Local"),
+                        // Relative, not "http://localhost:8080". Swagger UI resolves a relative
+                        // server against the page's own origin, so "Try it out" reaches whichever
+                        // host and port actually served the page. The absolute form that was here
+                        // was correct only on the default port: run the API on any other one --
+                        // as the verification captures do, on 9080 -- and every "Try it out" came
+                        // back "Failed to fetch", which reads as a broken API rather than as a
+                        // documentation bug. It also breaks behind any ingress or port-forward.
+                        new Server().url("/").description("This server"),
                         new Server().url("https://api.notification-platform.dev").description("Production")))
                 .components(new Components().addSecuritySchemes("bearerAuth", bearer))
                 .addSecurityItem(new SecurityRequirement().addList("bearerAuth"));

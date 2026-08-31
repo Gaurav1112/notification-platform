@@ -489,3 +489,22 @@ management:
     web:
       exposure:
         include: "*"
+
+# -----------------------------------------------------------------------------
+# local profile -- chaos injection.
+#
+# The base document sets `enabled: false` and its comment claimed the endpoint was
+# "enabled only in the local profile". No local document ever set it, so the endpoint
+# did not exist in any running process and POSTing to it answered 404. The comment
+# described an intention; this document is the thing that makes it true.
+# -----------------------------------------------------------------------------
+---
+spring:
+  config:
+    activate:
+      on-profile: local
+
+notification:
+  providers:
+    mock-chaos:
+      enabled: true

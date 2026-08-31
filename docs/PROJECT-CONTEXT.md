@@ -4,9 +4,9 @@
 > full context on this project. No external links required. Everything here is either verified
 > against the running system or explicitly labelled as unverified.
 >
-> **State as of 2026-08-31, commit `5bc4316`.** 16 commits. `./mvnw verify` → BUILD SUCCESS,
-> 384 tests, 0 failures. All three applications boot. Work is in progress on four remaining items
-> listed in §11.
+> **State as of 2026-08-31, commit `b5c9f48`.** 17 commits. `./mvnw -B clean verify` → BUILD
+> SUCCESS, **406 tests**, 0 failures; **444** under `-Pintegration`. All three applications boot.
+> Work is in progress on the items listed in §11 and in [STATUS.md](STATUS.md).
 
 ---
 
@@ -350,11 +350,12 @@ Run `./scripts/capture-verification.sh`; raw output lands in `docs/verification/
 
 | Fact | Value |
 |---|---|
-| `./mvnw verify` | **BUILD SUCCESS**, 384 tests, 0 failures |
-| `-Pintegration` | Green (Testcontainers) |
+| `./mvnw -B clean verify` | **BUILD SUCCESS**, 406 tests, 0 failures |
+| `-Pintegration` | **BUILD SUCCESS**, 444 tests, 0 failures |
 | Schema on PostgreSQL 18.6 | applies clean under `ON_ERROR_STOP=1` |
-| Objects created | **120 tables · 6 partitioned parents · 107 table partitions · 260 indexes · 298 check constraints** |
-| Flyway on boot | **0 tables → 121** |
+| Objects created by `V1` | **120 tables · 6 partitioned parents · 107 table partitions · 260 indexes · 298 check constraints** |
+| Objects created by `V1` + `V2` | **139 tables · 7 partitioned parents · 125 table partitions · 336 indexes · 450 check constraints** |
+| Flyway on boot | 3 migrations, **0 tables → 140** |
 | `app-api` startup | ~4–6 s |
 | `POST /v1/notifications` | **202** with a notification id |
 | Same key + same body | **202, byte-identical response** |
@@ -462,8 +463,10 @@ code* vs *needs infrastructure*.
 
 ## 9. Testing approach
 
-**384 tests**, no Docker required by default; Testcontainers tests are `@Tag("integration")` and run
-under `-Pintegration`.
+**406 tests**, no Docker required by default; the 38 Testcontainers tests are `@Tag("integration")`
+and run under `-Pintegration`, for 444. Only two classes need a container —
+`platform-persistence`'s `AbstractPostgresTest` and `ScheduledWorkStoreIntegrationTest`.
+`KafkaPipelineIntegrationTest` uses `@EmbeddedKafka` and runs in the Docker-less build.
 
 The suite was audited against **test-oracle quality** — the mechanism that decides whether a test
 passed:
@@ -508,14 +511,19 @@ tenant's notification is a 404 and never a 403, because a 403 confirms it exists
 
 ## 11. Known gaps (honest)
 
-**In progress right now** (a parallel agent workflow is running):
-1. `notif.scheduled_notification` has no migration — the scheduler's `SKIP LOCKED` claim SQL has
-   never executed. Every scheduled send is dead.
-2. Six of seven Kafka producers discard the send future then ack, so a broker blip strands
-   recipients in `QUEUED` with no retry, no DLQ, no alert.
-3. Tenant scoping is missing on `NotificationRecipientRepository` and `DeliveryAttemptRepository`;
-   `applyStatusTransition` and `findInWindow` are unscoped.
-4. `STATUS.md` needs rewriting from verified facts.
+**Closed since this document was first written:**
+1. ~~`notif.scheduled_notification` has no migration~~ — `V2__scheduled_notification.sql` creates it;
+   the scheduler now runs a full session with zero `relation does not exist` errors. No scheduled
+   send has been observed *firing*, which is a separate and still-open claim.
+2. ~~Kafka producers discard the send future then ack~~ — `PublishBatch` blocks on every in-flight
+   produce under one shared deadline before the offset is committed.
+3. ~~Tenant scoping missing on `NotificationRecipientRepository` and `DeliveryAttemptRepository`~~ —
+   fixed, and `TenantScopedQueryArchTest` now fails the build on the next unscoped query.
+4. ~~`STATUS.md` needs rewriting from verified facts~~ — rewritten; it is the authoritative account.
+
+**Open, and the one that loses work:** a request that supplies inline `content` instead of a
+`template` passes validation, returns `202`, and is then dead-lettered — `NotificationRequestedEvent`
+has no field to carry the body. See [STATUS.md](STATUS.md).
 
 **Known and not yet addressed:**
 - `TracedProvider` and `RateLimitedProvider` are still pass-throughs

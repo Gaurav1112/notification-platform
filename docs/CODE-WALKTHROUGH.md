@@ -14,13 +14,17 @@ way, and what to say about it. Grows with the repo.
 **Prerequisite reading:** [UNDERSTANDING-THE-DESIGN.md](UNDERSTANDING-THE-DESIGN.md) for the
 *why*, this document for the *how*.
 
-Progress: **11 modules built** · 273 main + 63 test Java files · **392 tests green** (371 without
-Docker, 392 with `-Pintegration`) · schema verified on PostgreSQL 18.6
+Progress: **11 modules built** · 301 main + 76 test Java files · **406 tests green without Docker**,
+444 with `-Pintegration` · schema verified on PostgreSQL 18.6 · all three applications boot.
 
-> **Read [STATUS.md](STATUS.md) alongside this.** Three of the six provider decorators are
-> deliberate pass-throughs today, and `app-api` cannot boot because its three inbound ports have no
-> adapters. Both are called out in place below. This document explains what the code *does*, and it
-> says so plainly when the answer is "nothing yet, and here is why the seam exists anyway".
+> **Read [STATUS.md](STATUS.md) alongside this.** Two of the six provider decorators are still
+> pass-throughs, a request that sends inline `content` is accepted and then dead-lettered, and
+> nothing has been observed advancing past `QUEUED`. All three are called out in place below. This
+> document explains what the code *does*, and it says so plainly when the answer is "nothing yet,
+> and here is why the seam exists anyway".
+>
+> **Part 14 is the most useful part of this document for an interview.** It is four bugs that
+> shipped past a green test suite, each with the specific reason the tests could not have caught it.
 
 ---
 
@@ -202,14 +206,23 @@ and `Date` has no timezone, silently uses the system default, and is mutable.
 
 ## Part 2 — The schema
 
-Verified by applying it to a real PostgreSQL 18.6 container:
+Verified by applying it to an empty PostgreSQL 18.6 database. `V1` alone, and then with `V2`, which
+adds `scheduled_notification`:
 
 ```
-tables               120     (6 partitioned parents + 335 partitions)
-indexes              260
-check constraints    298
-delivery_status      16 rows
+                     V1      V1+V2
+tables               120     139     (partitioned parents + partitions + plain tables)
+  partitioned parents  6       7
+  partitions         107     125
+  plain tables         7       7
+indexes              260     336
+check constraints    298     450
+delivery_status   16 rows
 ```
+
+An earlier revision of this document said "335 partitions". That number conflated table partitions
+with partitioned-*index* children and was wrong; the counts above come from `pg_class.relkind` and
+are what `.github/workflows/ci.yml`'s `schema` job asserts.
 
 ### `delivery_status` is a table, not an enum
 
@@ -494,24 +507,105 @@ Only `Accepted` short-circuits. A previous `Indeterminate` **must** be allowed t
 caller's own policy — silently treating "we do not know" as "already sent" would drop real
 messages.
 
-### Three decorators are pass-throughs today
+### `CircuitBreakerProvider` — the pass-through that survived 371 tests
 
-`CircuitBreakerProvider`, `RateLimitedProvider` and `TracedProvider` currently forward to their
-delegate and carry a `TODO` describing exactly what they must do. This is deliberate and it is
-worth being able to defend:
+This one shipped as `return delegate.send(command);` for a release, and it is the most useful bug in
+the repository, because **nothing failed**.
 
-- The **circuit breaker logic exists and is tested** in `platform-resilience`
-  (`ProviderCircuitBreakerConfiguration`, `ProviderCircuitBreakers`, `FailureClassifier`), and the
-  worker's `ChannelProviderRouter` filters open circuits out of the candidate list. What is missing
-  is the *decorator* wiring, not the breaker.
-- The **rate limiter exists** (`RedisTokenBucketRateLimiter`) and is tested.
-- Keeping the empty decorators in the chain means the order never changes when they are filled in.
-  A stage added later has to be inserted somewhere, and "somewhere" is where the mistake happens.
+`grep -rn 'onSuccess\|onError\|executeSupplier' --include='*.java' */src/main/java` returned nothing.
+The breakers were configured, registered, exported as metrics, and fed by no one. So every breaker
+stayed permanently `CLOSED` — and a `CLOSED` breaker is indistinguishable from *"no provider has
+failed yet"*. There is no state a healthy system can be in that the broken system did not also
+report.
 
-**Say:** *"Three of the six decorators are stubs with the policy written into the Javadoc. The
-components they'll delegate to are built and tested — the breaker, the classifier, the limiter. I
-kept the empty stages in the chain so the ordering doesn't move when they're wired, because
-inserting a stage into an existing chain is where the ordering bug gets introduced."*
+The cascade downstream is what makes it worth telling:
+
+- `ChannelProviderRouter`'s "filter out open circuits" step could never remove a candidate.
+- `getFailureRate()` returns `-1` for an empty window. The router mapped that to a success rate of
+  `1.0`, so the **dominant term of the provider score was a constant** — health-weighted selection
+  was selecting on nothing.
+- `ProviderHealthGate`, which pauses a lane when every provider for a channel is down, could never
+  fire.
+
+A provider returning 5xx on 100% of calls would have kept winning selection. The only thing that
+could ever remove a provider from the pool was a manual chaos injection — **which is exactly why the
+demo worked while the mechanism did not**.
+
+The fix is `platform-provider/.../decorator/CircuitBreakerProvider.java`, and it makes three
+decisions worth defending:
+
+```java
+if (result instanceof SendResult.Rejected rejected) {
+    if (FailureClassifier.shouldRecordAsCircuitFailure(rejected.type())) {
+        breaker.onError(elapsed, breaker.getTimestampUnit(),
+                new ProviderUnhealthy(rejected.type(), rejected.message()));
+    } else {
+        // A permanent, message-specific failure. The provider answered correctly and
+        // promptly; it simply refused this payload. Counting it would be wrong.
+        breaker.onSuccess(elapsed, breaker.getTimestampUnit());
+    }
+    return;
+}
+```
+
+1. **A 4xx does not trip the breaker.** An invalid recipient or a payload we built wrong is our
+   problem, not the provider's health. Counting it lets a batch of bad phone numbers take a healthy
+   provider offline for every tenant.
+2. **A short circuit returns `Rejected(CIRCUIT_OPEN)`, never an exception.** The SPI contract is that
+   implementations do not throw for business outcomes, and the type is retryable, so the router
+   fails over rather than dead-lettering a message that is perfectly fine.
+3. **`Indeterminate` counts as a failure.** A timeout is ambiguous for the *message* and unambiguous
+   about the *provider*: it stopped answering.
+
+And a fourth decision in the builder. `ProviderDecoratorChain` used to take a no-arg
+`circuitBroken()` flag — a signature under which "the decorator is present" and "the decorator
+records anything" were separate facts. It now takes the registry, so **the pass-through state is no
+longer expressible**.
+
+#### Why the tests missed it, and what the new test does differently
+
+Every test on this decorator asserted on the *result of a healthy call*. A decorator that does
+nothing returns exactly the same result as a decorator that does everything, for every input where
+nothing is wrong. `CircuitBreakerProviderTest` now asserts on **breaker state** after driving
+traffic:
+
+```
+@DisplayName("repeated 5xx opens the circuit — the state a pass-through could never reach")
+@DisplayName("an open circuit stops calling the provider at all")
+@DisplayName("a 4xx does NOT trip the breaker — a bad phone number is our problem, not the provider's")
+@DisplayName("the breaker is per (provider, channel), so one bad provider cannot mute another")
+```
+
+State is the thing a no-op cannot fake. Verify it live on the worker, not the API:
+
+```bash
+curl -s http://localhost:8082/actuator/prometheus | grep provider_circuit_state
+# provider_circuit_state{channel="email",provider="mock-email-primary"} 0.0
+```
+
+**Say in an interview:** *"A resilience component with no failing dependency is untestable by
+accident — everything passes. My circuit breaker was a pass-through for a release and 371 tests
+stayed green, because a permanently-closed breaker looks exactly like a healthy system. The lesson I
+took is that for anything whose job is to react to failure, the assertion has to be on the
+component's own state after driving it into failure, not on the happy-path result."*
+
+### Two decorators are still pass-throughs
+
+`RateLimitedProvider` and `TracedProvider` forward to their delegate and carry a `TODO` describing
+what they must do.
+
+- The **rate limiter is real and has a production caller** — `RedisQuotaGuard` wraps
+  `RedisTokenBucketRateLimiter` and is the bean behind the application's `QuotaGuard` port, so
+  per-tenant quota is enforced at accept time. What is missing is the per-provider limiter at the
+  send edge.
+- **Tracing has no implementation at all.** `platform-observability` is a `package-info.java`.
+- Keeping the empty stages in the chain means the order never changes when they are filled in. A
+  stage added later has to be inserted somewhere, and "somewhere" is where the mistake happens.
+
+**Say:** *"Two of the six are stubs with the policy in the Javadoc, and I keep the empty stages in
+the chain so the ordering doesn't move when they're wired — inserting into an existing chain is
+where the ordering bug gets introduced. But I'd rather talk about the third one, which used to be a
+stub and taught me something."*
 
 ---
 
@@ -1305,6 +1399,9 @@ five hours in which the user can unsubscribe, and a suppression arriving in that
 > body unchanged, and `LoggingSuppressionWriter` logs rather than writing to `suppression_entry`. The
 > ports and the schema exist; the real implementations do not.
 
+> **`RequestFanOut` used to create fresh notification rows here and orphan every id the `202` had
+> handed out.** See [Part 14](#part-14--four-bugs-that-shipped-past-a-green-suite).
+
 **Say:** *"The step that matters is committing the attempt row as PENDING before the network call. If
 the pod dies mid-send, redelivery finds a PENDING row with a start time and knows 'we may have sent
 this'. Write the row afterwards and the crash is indistinguishable from never having sent, which
@@ -1457,11 +1554,12 @@ second against 159 for the naive form."*
 
 `app-api/`
 
-> **Honest note:** `app-api` compiles and its 29 tests pass, but **it cannot boot today.** Its three
-> inbound ports — `NotificationCommandPort`, `NotificationQueryPort`, `WebhookIngestPort` — have no
-> implementations anywhere in the reactor, so a real context start fails with
-> `UnsatisfiedDependencyException`. The controllers, DTOs, error handling, interceptors and webhook
-> verifier are all real and tested against mocked ports. See [STATUS.md](STATUS.md).
+> **Honest note:** `app-api` boots in **3.78 s** and serves the accept path. Its three inbound ports
+> — `NotificationCommandPort`, `NotificationQueryPort`, `WebhookIngestPort` — now have adapters
+> (`NotificationCommandAdapter`, `NotificationQueryAdapter`, `InMemoryWebhookIngestAdapter`), and
+> `ApplicationContextSmokeTest` starts the real context in the default build so the gap cannot
+> silently reopen. `InMemoryWebhookIngestAdapter` is the one to keep an eye on: it is in-JVM, because
+> `V1__baseline.sql` has no raw-webhook table. See [STATUS.md](STATUS.md).
 
 ### The controller is thin on purpose
 
@@ -1612,6 +1710,238 @@ commit rate below, never alone"* and *"Consumer commit rate — flat zero here w
 poison pill."*
 
 Full catalogue: [OBSERVABILITY.md](OBSERVABILITY.md).
+
+---
+
+## Part 14 — Four bugs that shipped past a green suite
+
+Each of these was live in a build that reported zero failures. They are grouped here because they
+share one shape: **the test suite asserted on the layer where the code was right, and the bug lived
+one layer down.** The circuit-breaker pass-through in [Part 4](#circuitbreakerprovider--the-pass-through-that-survived-371-tests)
+is the fifth and the worst of them.
+
+### 14.1 · `AcceptResult` serialised its own accessor over its own field
+
+`AcceptResult` is the response to `POST /v1/notifications`. It had both a `replay` record component
+and a convenience accessor:
+
+```java
+public record AcceptResult(
+        UUID requestId, Instant acceptedAt, int recipientCount,
+        List<AcceptedNotification> notifications, Replay replay) {
+
+    public boolean isReplay() { return replay != null; }   // <- the bug
+}
+```
+
+Jackson maps a no-arg `isXxx()` to a boolean property named `xxx`. So the serialiser wrote
+`"replay": false` **over** the `Replay` object, and reading the stored idempotency response back
+threw `MismatchedInputException: cannot construct Replay from boolean value (false)`.
+
+The blast radius: **every idempotent replay returned HTTP 500.** That is the single behaviour the
+`Idempotency-Key` header exists to provide.
+
+The fix is a rename to `hasReplay()`, which is nine characters and not the interesting part.
+
+#### Why nine unit tests missed it
+
+There were nine tests over `AcceptResult`, and **all nine assert on the in-memory object**:
+construct it, call `hasReplay()`, check the notification list, check the invariants in the compact
+constructor. Every one of them passes against the buggy code, because the object is correct — it is
+the *projection of the object onto JSON and back* that is broken, and no test performed that
+projection. Serialisation was treated as infrastructure that Jackson handles, which is true right up
+until a naming rule you did not know about collides with a field you do own.
+
+The regression oracle is `app-api/src/test/.../AcceptResultSerializationTest.java`, three tests, all
+of them round trips:
+
+```
+@DisplayName("an acceptance survives a JSON round trip with its notification ids intact")
+@DisplayName("the replay accessor must not shadow the replay component and serialise as a boolean")
+@DisplayName("a body stored on first accept is readable on the replay, which is what 202 promises")
+```
+
+**Say in an interview:** *"I had nine unit tests on a response record and a 500 on every idempotent
+replay, because the tests asserted on the object and the bug was in the object's JSON projection —
+a `isReplay()` accessor that Jackson mapped over the `replay` field. Anything that crosses a
+serialisation boundary needs at least one round-trip test, because that boundary has naming rules
+your type system does not know about."*
+
+### 14.2 · Fan-out created a second notification row and orphaned the id in the `202`
+
+`RequestFanOut.expand` created a fresh `notification` row per channel. But the accept transaction had
+**already** written one per channel — and those ids are what the `202` returned and what the caller
+polls.
+
+So every request produced two rows per channel. The id the caller held stayed `PENDING` forever,
+because nothing advanced it; a second, invisible row did the actual work. `GET
+/v1/notifications/{id}` was therefore **permanently wrong for every notification in the system**, and
+the row count on the hottest table was double.
+
+Fan-out now adopts:
+
+```java
+var existing = notifications
+        .findByRequest(event.requestId(), event.tenantId(),
+                now.minus(FANOUT_LOOKBACK), now.plus(FANOUT_LOOKAHEAD))
+        .stream()
+        .collect(Collectors.toMap(NotificationEntity::getChannel, identity(), (first, dup) -> first));
+...
+var notification = existing.get(channel);
+if (notification == null) {
+    notification = newNotification(event, channel, now);
+    log.warn("no accept-time notification row for request {} channel {}; creating one. "
+             + "Expected only on replay or a direct-enqueue path.", event.requestId(), channel);
+}
+// QUEUED (30) outranks PENDING (10), so this advances the row the caller is polling
+notification.setStatus(DeliveryStatus.QUEUED);
+```
+
+Three details in that snippet are load-bearing:
+
+- **The create path stays, and warns.** A request can legitimately reach fan-out with no accept row —
+  a replay after the `notification` partition was dropped, or a future direct-enqueue path. Deleting
+  the branch would turn a rare case into data loss; keeping it silent would hide the common case.
+- **The lookup carries an explicit `created_at` window.** `notification` is partitioned on
+  `created_at`, so an unbounded query is an `Append` across all 90 partitions. The window covers a
+  broker outage drained by the outbox sweeper, plus clock skew between pods.
+- **It is scoped by `tenantId`, not just by request id.** This is an adoption, not a read: the row it
+  finds gets this campaign's recipients hung off it. A request id that reached another tenant's row
+  would graft one tenant's audience onto the other's notification. `TenantScopedQueryArchTest` is
+  what stops the next version of this query from forgetting.
+
+The bug was visible for a while as "two rows for one request" in a manual run and written off as
+leftover test data. It only became undeniable when a second agent hit it independently.
+
+**Say in an interview:** *"Fan-out was creating notification rows that accept had already created, so
+the id in the 202 was a row nothing ever touched and the status endpoint was wrong for every request
+in the system. What made it survive is that both halves worked in isolation — accept wrote a correct
+row, fan-out wrote a correct row, and no test owned the seam between them. The fix is an adoption
+keyed by channel, with an explicit partition window and a tenant predicate, because the lookup is a
+write in disguise."*
+
+### 14.3 · The table the scheduler had always queried and no migration had ever created
+
+`JdbcScheduledWorkStore` targeted `notif.scheduled_notification`. `V1__baseline.sql` did not create
+it.
+
+The failure mode is the quiet kind. `app-scheduler` **booted fine**, then raised
+`relation "notif.scheduled_notification" does not exist` on every claimer tick — 100 ms, across 256
+shards — and on every hydrator scan. Nothing crashed, nothing was lost, and every scheduled and
+deferred send simply never happened.
+
+`V2__scheduled_notification.sql` fixes it, and the one choice in it worth arguing about is the
+partition key. `due_at` is the obvious key and it is the wrong one:
+
+```sql
+-- The partition key, and immutable by construction: derived from due_at at
+-- insert, guarded by a trigger, never updated.
+due_bucket  date  NOT NULL,
+```
+
+A partition-key `UPDATE` is not an update. PostgreSQL turns it into a `DELETE` plus an `INSERT` in
+another partition, at roughly triple the WAL cost — and it breaks the claim outright. `FOR UPDATE
+SKIP LOCKED` can step over a tuple another session has *locked*; it cannot ignore one that was
+*moved* out from under it. The concurrent session gets `ERROR 40001, tuple to be locked was already
+moved to another partition due to concurrent update`, on the hottest loop in the platform.
+
+So `due_bucket` is derived once at insert and trigger-guarded, and rescheduling is an explicit
+`DELETE` + `INSERT`. `date` rather than a truncated `timestamptz` because `notif.ensure_daily_partition`
+from V1 takes a date.
+
+Everything else in the file follows V1's conventions on purpose: `varchar` + `CHECK` rather than
+native enums, `timestamptz` everywhere, no foreign keys on a partitioned hot table, and a composite
+primary key leading with the partition column because PostgreSQL requires every unique constraint to
+contain the partition key.
+
+`ScheduledWorkStoreIntegrationTest` landed in the same commit — the scheduler's other three test
+classes cover jitter, lease reaping and leader election, none of which touch a table, which is
+precisely why a missing table was invisible to all of them.
+
+The scheduler now runs a full session with **zero** `does not exist` and **zero** `ERROR` lines, and
+takes leadership with a fencing token:
+
+```
+LeaderElection: acquired leadership of notification-hydrator … with fencing token 8
+```
+
+Note what is still *not* proven: no scheduled send has been observed firing end to end. The table
+exists, the claimer polls it without error, and that is a different and smaller claim than "scheduled
+delivery works".
+
+**Say in an interview:** *"A missing table did not crash anything. The scheduler booted, logged a
+relation-does-not-exist every 100 ms across 256 shards, and silently never fired a scheduled send.
+That is the failure profile I now look for first: the component that is up, green on its health
+check, and doing nothing. The migration that fixed it partitions on a derived immutable `due_bucket`
+rather than on `due_at`, because a partition-key update turns `SKIP LOCKED` into a 40001 storm on the
+hottest loop in the system."*
+
+### 14.4 · `kafkaTemplate.send()` does not throw, so the ack outran the broker
+
+`kafkaTemplate.send()` is asynchronous. A broker outage does not throw from it — it completes the
+returned future exceptionally, seconds or minutes later.
+
+A listener that discards that future and calls `ack.acknowledge()` has committed the offset for a
+record whose effect never left the JVM. During a 30-second broker blip, in a campaign, that is every
+dispatch event in flight: recipients sit in `QUEUED` forever, with **no retry, no dead letter and no
+alert**, because from Kafka's point of view the work was done.
+
+`platform-messaging/.../producer/PublishBatch.java` exists so the ack cannot happen before the
+confirmation:
+
+```java
+public void awaitAll(Duration budget) {
+    if (inFlight.isEmpty()) { return; }
+    long deadlineNanos = System.nanoTime() + budget.toNanos();
+    for (int i = 0; i < inFlight.size(); i++) {
+        awaitOne(inFlight.get(i), i, deadlineNanos, budget);
+    }
+    inFlight.clear();
+}
+```
+
+Four decisions in a fourteen-line method:
+
+- **One deadline for the whole batch, not per future.** A per-future timeout of 10 s across a
+  500-event fan-out is 83 minutes of one consumer thread in the worst case — far past
+  `max.poll.interval.ms`, so the cure would be a rebalance storm. The sends are all in flight
+  concurrently, so the batch normally completes in about the time of the slowest single send, not
+  the sum.
+- **The budget bounds the wait, not the work.** It is passed to `awaitAll`, not to the constructor. A
+  channel worker adds its first future *before* an 8-second provider call and waits afterwards; a
+  deadline started at construction would already have expired.
+- **`System.nanoTime()`, not wall clock.** The deadline has to survive an NTP step; a clock adjusted
+  backwards mid-wait would otherwise extend the wait past the poll interval.
+- **A timeout is a failure, not a maybe.** The producer's own `delivery.timeout.ms` is 120 s, so a
+  future that has not completed within a budget measured in seconds is still retrying internally and
+  may yet succeed — which makes refusing to ack a *duplicate*, not a loss. Every consumer here is
+  idempotent, so a duplicate is absorbed and a loss is not recoverable at all. That trade is the
+  right way round.
+
+An already-completed future is `get()`-ed without spending budget, so a long batch of finished sends
+cannot expire the deadline for the one send still in flight.
+
+**Say in an interview:** *"`kafkaTemplate.send()` is async and a broker outage completes the future
+exceptionally rather than throwing, so a listener that acks without awaiting has committed an offset
+for a message that never left the JVM — and there is no retry and no DLQ, because Kafka thinks it
+succeeded. I collect the futures and block on all of them under one shared deadline before the ack.
+One deadline, not one per future, because per-future timeouts across a large fan-out exceed
+`max.poll.interval.ms` and the cure becomes a rebalance storm."*
+
+### What the five have in common
+
+| Bug | Where the tests looked | Where the bug was |
+|---|---|---|
+| Circuit-breaker pass-through | the result of a healthy call | the breaker's own state |
+| `AcceptResult` accessor | the in-memory object | its JSON projection |
+| Fan-out duplication | accept, and fan-out, separately | the seam between them |
+| Missing `scheduled_notification` | jitter, leases and leader election, none of which touch a table | the migration set |
+| Unawaited produce future | the publisher's return value | the offset commit that followed it |
+
+Four of the five are invisible to any test that exercises one component correctly. The cheapest
+counter-measure turned out to be the dullest one: a three-line `contextLoads()` per application
+(`ApplicationContextSmokeTest` × 3), which is what caught the class of "this cannot even be
+constructed" that 371 green unit tests had been coexisting with.
 
 ---
 
