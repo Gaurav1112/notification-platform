@@ -23,9 +23,16 @@ to build or run the stack.
 > **[STATUS.md](docs/STATUS.md) is the authoritative account** — it is kept accurate deliberately,
 > because a portfolio repository that overstates itself fails the moment someone clones it.
 
+**Jump to:** [Try it yourself](#) · [Architecture](docs/ARCHITECTURE.md) · [Learn it from zero](docs/LEARN-FROM-ZERO.md) · [Code walkthrough](docs/CODE-WALKTHROUGH.md) · [What's built](docs/STATUS.md) · [Security](SECURITY.md) · [ADRs](docs/adr/)
+
+*Sections below are collapsed — click any heading to expand.*
+
 ---
 
-## Verified, not claimed
+<details>
+<summary>▶︎ &nbsp;<b>Verified, not claimed</b> — build, boot times, schema counts, idempotency, all regenerated from live commands</summary>
+
+### Verified, not claimed
 
 Every figure below comes from `./scripts/capture-verification.sh`, which regenerates
 [docs/verification/](docs/verification/) from live commands. Nothing here is hand-written.
@@ -54,9 +61,14 @@ Every figure below comes from `./scripts/capture-verification.sh`, which regener
 > on synthetic schemas that are not in this repository**. They explain why the design is shaped
 > this way; they are not benchmarks of this code, and each document says so where they appear.
 
+</details>
+
 ---
 
-## Try it yourself
+<details>
+<summary>▶︎ &nbsp;<b>Try it yourself</b> — clone, run, and exercise every endpoint (9 steps, real captured output)</summary>
+
+### Try it yourself
 
 Everything below is **real captured output** from a running instance, not written by hand.
 Requires a JDK 17 and Docker; no credentials, no accounts, no vendor keys.
@@ -259,6 +271,8 @@ make test-it   # ./mvnw -B verify -Pintegration  392 tests, needs Docker
 
 Integration tests are tagged and excluded by default so a clean clone builds green on any machine.
 
+</details>
+
 
 ---
 
@@ -302,7 +316,10 @@ flowchart LR
 
 Full diagram set: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-## Documentation
+<details>
+<summary>▶︎ &nbsp;<b>Documentation</b> — 20 documents and 18 ADRs, with what each covers</summary>
+
+### Documentation
 
 | Doc | Contents |
 |---|---|
@@ -325,7 +342,12 @@ Full diagram set: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 | [adr/](docs/adr/) | 18 architecture decision records, each with the negative consequences |
 | [Design spec](docs/design/DESIGN-SPEC.md) | The full source document |
 
-## Quick start
+</details>
+
+<details>
+<summary>▶︎ &nbsp;<b>Quick start</b> — build, test, and start the stack</summary>
+
+### Quick start
 
 Requires only a **JDK 17** and **Docker**. No Maven install — the wrapper bootstraps itself.
 
@@ -451,7 +473,12 @@ t+…     3 probes succeed → CLOSED → traffic returns to the cheaper provide
 The point is not that the circuit opened. **It is that the accept path never returned a single error
 while it happened**, because accept and dispatch are decoupled by the outbox and Kafka.
 
-## Mock providers
+</details>
+
+<details>
+<summary>▶︎ &nbsp;<b>Mock providers</b> — what is mocked, what is not, and why</summary>
+
+### Mock providers
 
 There are no real vendor credentials in this repo — a design decision
 ([ADR-005](docs/adr/ADR-005-mock-providers.md)), not a shortcut.
@@ -479,7 +506,12 @@ breaker, the rate limiter, the retry engine and the status pipeline are real cod
 Adding a real provider is one class and two config rows —
 see [ADDING-A-PROVIDER.md](docs/ADDING-A-PROVIDER.md).
 
-## Project layout
+</details>
+
+<details>
+<summary>▶︎ &nbsp;<b>Project layout</b> — 11 modules and what each owns</summary>
+
+### Project layout
 
 ```
 platform-domain/          entities, value objects, enums, invariants — no Spring imports
@@ -501,7 +533,12 @@ Module dependencies are one-directional and the domain module's purity is **enfo
 no Spring, no JPA, no Kafka, no Jackson, no `java.util.Date`. Architecture that isn't enforced by a
 test is a wish.
 
-## Stack
+</details>
+
+<details>
+<summary>▶︎ &nbsp;<b>Stack</b> — pinned versions and the ones that must NOT be the newest</summary>
+
+### Stack
 
 Java 17 · Spring Boot 4.1.1 · Kafka 4.3.1 (KRaft) · PostgreSQL 18.6 · Valkey 9.1.1 · Resilience4j ·
 Flyway 12 · Testcontainers 2 · JUnit 6 + AssertJ · Micrometer · Prometheus + Grafana
@@ -514,7 +551,12 @@ Spring Boot 4 traps worth knowing: Jackson's groupId is `tools.jackson`; JUnit i
 2.x renamed every artefact; `@EntityScan` moved package; and `resilience4j-spring-boot3` on Boot 4
 fails **silently** — no error, no breakers.
 
-## Design honesty
+</details>
+
+<details>
+<summary>▶︎ &nbsp;<b>Design honesty</b> — what this project deliberately does not claim</summary>
+
+### Design honesty
 
 Things this project states rather than hides:
 
@@ -540,6 +582,8 @@ Things this project states rather than hides:
   the code it describes cannot currently run because `scheduled_notification` has no migration.
   Every document that quotes it says so where it appears.
 - **What is unfinished is listed, not implied.** [STATUS.md](docs/STATUS.md).
+
+</details>
 
 ## Licence
 
