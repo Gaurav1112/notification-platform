@@ -158,11 +158,11 @@ docker rm -f "$PG" >/dev/null 2>&1
 # ── 5. render each capture to PNG ────────────────────────────────────────────
 if [ "$RENDER" -eq 1 ]; then
   say "rendering PNGs"
-  command -v node >/dev/null || { echo "node not found, skipping render"; exit 0; }
+  :
   for txt in "$OUT"/*.txt; do
     base=$(basename "$txt" .txt)
     title=$(head -1 "$txt" | sed 's/^\$ //' | cut -c1-90)
-    node "$ROOT/scripts/render-terminal.mjs" "$txt" "$OUT/$base.png" "$base" || echo "  render failed: $base"
+    "$ROOT/scripts/render-terminal.sh" "$txt" "$OUT/$base.png" "$base" || echo "  render failed: $base"
     [ -f "$OUT/$base.png" ] && echo "  ✓ $base.png"
   done
 fi

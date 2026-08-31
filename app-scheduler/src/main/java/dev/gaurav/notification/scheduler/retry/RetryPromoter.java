@@ -130,7 +130,12 @@ public class RetryPromoter {
 
     private boolean promote(NotificationRecipient recipient, Instant now) {
         var notificationCreated = recipient.getNotificationCreatedAt();
+        // The sweep itself is cross-tenant by design, but this walk is not: the tenant comes from
+        // the recipient row we already hold, so a recipient whose notification_id points at another
+        // tenant's row — corruption, or a replayed event that wrote a bad reference — resolves to
+        // nothing and is reported as orphaned rather than rebuilt into a dispatch for that tenant.
         var parent = notifications.findInWindow(recipient.getNotificationId(),
+                recipient.getTenantId(),
                 notificationCreated.truncatedTo(ChronoUnit.DAYS),
                 notificationCreated.truncatedTo(ChronoUnit.DAYS).plus(1, ChronoUnit.DAYS));
 

@@ -27,7 +27,10 @@ import java.util.UUID;
  * zero and the caller is told {@code ALREADY_DISPATCHED}, which is the truth.
  *
  * <p>A cross-tenant id is indistinguishable from an unknown one because the tenant is a predicate
- * in the lookup, not a check on its result — see {@code findInWindowForTenant}.
+ * in both statements, not a check on a result. The lookup narrows by tenant and so does the
+ * {@code UPDATE}: scoping only the lookup would leave the write addressable by id alone, and the
+ * write is the irreversible half — a cancel that lands on another tenant's notification cannot be
+ * undone, because the guard is monotonic and {@code CANCELLED} outranks what came before it.
  *
  * <p>Note that one request fans out to one {@code notification} per channel, so cancelling the
  * envelope means cancelling each of them. This port is addressed by notification id, so it cancels
@@ -50,17 +53,18 @@ public class JpaCancellationWriter implements CancellationWriter {
         if (tenant.isEmpty()) {
             return CancelOutcome.NOT_FOUND;
         }
-        var found = notifications.findInWindowForTenant(notificationId, tenant.get(),
+        var found = notifications.findInWindow(notificationId, tenant.get(),
                 PartitionWindows.lookbackFrom(now), PartitionWindows.lookbackTo(now));
         if (found.isEmpty()) {
             return CancelOutcome.NOT_FOUND;
         }
-        return applyCancel(found.get(), now);
+        return applyCancel(found.get(), tenant.get(), now);
     }
 
-    private CancelOutcome applyCancel(NotificationEntity notification, Instant now) {
+    private CancelOutcome applyCancel(NotificationEntity notification, long tenant, Instant now) {
         int updated = notifications.applyStatusTransition(
                 notification.getId(),
+                tenant,
                 PartitionWindows.dayStart(notification.getCreatedAt()),
                 PartitionWindows.dayEnd(notification.getCreatedAt()),
                 DeliveryStatus.CANCELLED.name(),

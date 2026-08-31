@@ -18,6 +18,9 @@ import org.springframework.transaction.annotation.Transactional;
  *
  * <p>The inherited {@code findById}, {@code delete} and {@code findAll} methods work but will
  * scan every partition; prefer the window-bounded methods declared here. See the package javadoc.
+ *
+ * <p>{@link #findExpiredInWindow} is the one method here that deliberately sweeps across tenants;
+ * it is named in the allowlist inside {@code TenantScopedQueryArchTest} together with the reason.
  */
 public interface NotificationRepository extends JpaRepository<NotificationEntity, UUID> {
 
@@ -33,6 +36,12 @@ public interface NotificationRepository extends JpaRepository<NotificationEntity
      * <ul>
      *   <li>{@code created_at} between the bounds — partition pruning. Without it this is a scan
      *       of every partition in the retention window.</li>
+     *   <li>{@code tenant_id = :tenantId} — the isolation boundary. A notification id is a bare
+     *       UUID that appears in an API response and on every Kafka event, so it is an identifier
+     *       an outside caller can hold. Without this predicate, a cancel or a status callback
+     *       naming another tenant's notification <em>succeeds</em>, and because the guard is
+     *       monotonic the write cannot be undone: a forged terminal status permanently stops that
+     *       notification, and the real provider callback is then refused as post-terminal.</li>
      *   <li>{@code status_rank < :newRank} — rejects an event that is stale (a late {@code SENT}
      *       arriving after {@code DELIVERED}) and, because the comparison is strict, also rejects
      *       an exact duplicate (the same {@code DELIVERED} webhook delivered twice).</li>
@@ -66,6 +75,7 @@ public interface NotificationRepository extends JpaRepository<NotificationEntity
                    status_at   = greatest(n.status_at, :occurredAt),
                    updated_at  = now()
              WHERE n.id          = :id
+               AND n.tenant_id    = :tenantId
                AND n.created_at >= :createdAtFrom
                AND n.created_at  < :createdAtTo
                AND n.status_rank < :newRank
@@ -75,24 +85,27 @@ public interface NotificationRepository extends JpaRepository<NotificationEntity
                                   AND d.is_terminal)
             """, nativeQuery = true)
     int applyStatusTransition(@Param("id") UUID id,
+                              @Param("tenantId") Long tenantId,
                               @Param("createdAtFrom") Instant createdAtFrom,
                               @Param("createdAtTo") Instant createdAtTo,
                               @Param("newStatus") String newStatus,
                               @Param("newRank") short newRank,
                               @Param("occurredAt") Instant occurredAt);
 
-    /** Point lookup, pruned. Served by {@code n_id_uk} — 7 buffers when the window is one day. */
-    @Query("""
-            SELECT n FROM NotificationEntity n
-             WHERE n.id = :id
-               AND n.createdAt >= :createdAtFrom
-               AND n.createdAt <  :createdAtTo
-            """)
-    Optional<NotificationEntity> findInWindow(@Param("id") UUID id,
-                                              @Param("createdAtFrom") Instant createdAtFrom,
-                                              @Param("createdAtTo") Instant createdAtTo);
-
-    /** Tenant-scoped point lookup. Cross-tenant reads must return empty, not another tenant's row. */
+    /**
+     * Point lookup, pruned and tenant-scoped. Served by {@code n_id_uk} — 7 buffers when the window
+     * is one day.
+     *
+     * <p>There used to be two of these: this one without a tenant and a {@code findInWindowForTenant}
+     * with one. That pair is the bug, not the fix — a repository that offers a safe and an unsafe
+     * version of the same lookup will be called with the unsafe one, and the call site that does it
+     * looks exactly like the call site that does not. There is one lookup now and the tenant is not
+     * optional.
+     *
+     * <p>Tenant is a predicate rather than a check on the result, so an unknown id and another
+     * tenant's id produce the same empty answer and the endpoint above cannot be used to test
+     * whether a notification exists.
+     */
     @Query("""
             SELECT n FROM NotificationEntity n
              WHERE n.id = :id
@@ -100,25 +113,46 @@ public interface NotificationRepository extends JpaRepository<NotificationEntity
                AND n.createdAt >= :createdAtFrom
                AND n.createdAt <  :createdAtTo
             """)
-    Optional<NotificationEntity> findInWindowForTenant(@Param("id") UUID id,
-                                                       @Param("tenantId") Long tenantId,
-                                                       @Param("createdAtFrom") Instant createdAtFrom,
-                                                       @Param("createdAtTo") Instant createdAtTo);
+    Optional<NotificationEntity> findInWindow(@Param("id") UUID id,
+                                              @Param("tenantId") Long tenantId,
+                                              @Param("createdAtFrom") Instant createdAtFrom,
+                                              @Param("createdAtTo") Instant createdAtTo);
 
-    /** The fan-out of one request. Served by {@code n_request_ix}. */
+    /**
+     * The fan-out of one request. Served by {@code n_request_ix}.
+     *
+     * <p>Tenant-scoped, and this one is a write hazard rather than a read leak. Its caller,
+     * {@code RequestFanOut}, does not merely read these rows — it <em>adopts</em> them, keyed by
+     * channel, and then hangs a campaign's recipient rows off whatever it found. Unscoped, a
+     * request id that collided with another tenant's would make the expander attach one tenant's
+     * audience, ciphertext and all, to the other tenant's notification row, and advance that row's
+     * status while it did it. The tenant predicate is what makes a wrong-tenant request expand
+     * into fresh rows of its own instead of into someone else's campaign.
+     *
+     * <p>The caller is an internal Kafka consumer today, but "no external caller" is a property of
+     * the current wiring rather than of this query, and adoption is the kind of write that nobody
+     * would notice going wrong.
+     */
     @Query("""
             SELECT n FROM NotificationEntity n
              WHERE n.requestId = :requestId
+               AND n.tenantId = :tenantId
                AND n.createdAt >= :createdAtFrom
                AND n.createdAt <  :createdAtTo
              ORDER BY n.createdAt
             """)
     List<NotificationEntity> findByRequest(@Param("requestId") UUID requestId,
+                                           @Param("tenantId") Long tenantId,
                                            @Param("createdAtFrom") Instant createdAtFrom,
                                            @Param("createdAtTo") Instant createdAtTo);
 
     /**
      * Notifications whose TTL has elapsed while they were still in flight.
+     *
+     * <p><strong>Deliberately cross-tenant.</strong> A TTL is our promise, not a tenant's request:
+     * the reaper runs on a timer with no caller to scope it by, and a per-tenant variant would
+     * leave every tenant nobody enumerated with notifications stuck in flight forever. Allowlisted
+     * in {@code TenantScopedQueryArchTest}.
      *
      * <p>Read-only hint because this feeds a reaper that never mutates through the entity — it
      * emits an expiry event and lets the guard do the write. Without the hint Hibernate keeps

@@ -26,6 +26,9 @@ import org.springframework.beans.factory.annotation.Autowired;
  */
 class MonotonicGuardIntegrationTest extends AbstractPostgresTest {
 
+    /** The tenant every row in this class belongs to. Cross-tenant refusal is proved separately. */
+    private static final long TENANT = 1L;
+
     @Autowired
     private NotificationRepository notifications;
 
@@ -42,7 +45,7 @@ class MonotonicGuardIntegrationTest extends AbstractPostgresTest {
         windowTo = windowFrom.plus(Duration.ofDays(1));
 
         var notification = new NotificationEntity(
-                notificationId, UUID.randomUUID(), 1L, Channel.SMS,
+                notificationId, UUID.randomUUID(), TENANT, Channel.SMS,
                 TrafficClass.TRANSACTIONAL, createdAt.plus(Duration.ofHours(24)));
         notification.setCreatedAt(createdAt);
         notification.setStatus(DeliveryStatus.SENT);
@@ -122,7 +125,7 @@ class MonotonicGuardIntegrationTest extends AbstractPostgresTest {
         var yesterdayFrom = windowFrom.minus(Duration.ofDays(1));
 
         var rowsAffected = notifications.applyStatusTransition(
-                notificationId, yesterdayFrom, windowFrom,
+                notificationId, TENANT, yesterdayFrom, windowFrom,
                 DeliveryStatus.DELIVERED.name(), (short) DeliveryStatus.DELIVERED.rank(), Instant.now());
 
         // Worth pinning down: the window is a correctness parameter, not a hint. Derive it from
@@ -154,12 +157,12 @@ class MonotonicGuardIntegrationTest extends AbstractPostgresTest {
 
     private int apply(DeliveryStatus proposed, Instant occurredAt) {
         return notifications.applyStatusTransition(
-                notificationId, windowFrom, windowTo,
+                notificationId, TENANT, windowFrom, windowTo,
                 proposed.name(), (short) proposed.rank(), occurredAt);
     }
 
     private DeliveryStatus currentStatus() {
-        return notifications.findInWindow(notificationId, windowFrom, windowTo)
+        return notifications.findInWindow(notificationId, TENANT, windowFrom, windowTo)
                 .map(NotificationEntity::getStatus)
                 .orElseThrow();
     }

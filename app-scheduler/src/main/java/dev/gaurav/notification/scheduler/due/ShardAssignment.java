@@ -7,6 +7,7 @@ import java.util.Comparator;
 import java.util.Map;
 import java.util.stream.IntStream;
 
+import dev.gaurav.notification.persistence.schedule.ScheduledNotificationWriter;
 import dev.gaurav.notification.scheduler.config.NodeIdentity;
 import dev.gaurav.notification.scheduler.config.SchedulerProperties;
 
@@ -59,8 +60,13 @@ public class ShardAssignment {
      * {@code scheduled_notification.shard} at insert and into the Redis key
      * {@code due:{shard}} at hydration. Changing the count orphans every already-hydrated key and
      * makes rows nobody polls.
+     *
+     * <p>Aliased from the writer rather than declared again. The reader and the writer of that
+     * column live in different modules, and two independent {@code 256}s is a number that can be
+     * changed in one place — after which pods poll shards no row is ever stamped with, and the
+     * only symptom is throughput quietly falling by whatever fraction of the space diverged.
      */
-    public static final int SHARD_COUNT = 256;
+    public static final int SHARD_COUNT = ScheduledNotificationWriter.SHARD_COUNT;
 
     /** Field is the pod name, value is the last heartbeat in epoch millis. */
     private static final String MEMBERS_KEY = "scheduler:members";

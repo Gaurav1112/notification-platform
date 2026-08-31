@@ -91,13 +91,18 @@ public class MonotonicDeliveryStatusService implements ApplyDeliveryStatusUseCas
         var rowWindow = PartitionWindow.forDispatch(command.notificationCreatedAt());
         short rank = (short) command.status().rank();
 
+        // The tenant travels on the command and goes into both guards as a predicate. Neither row
+        // is addressable by id alone: a dispatch event or a webhook naming another tenant's
+        // recipient now updates nothing, and because these updates are monotonic that is the only
+        // place the check can live — once a forged terminal status lands, nothing can move the row
+        // back and the genuine provider callback is refused as post-terminal.
         int recipientRows = recipients.applyStatusTransition(
-                command.recipientId(), rowWindow.from(), rowWindow.to(),
+                command.recipientId(), command.tenantId(), rowWindow.from(), rowWindow.to(),
                 command.status().name(), rank, command.occurredAt());
 
         if (advancesParent(command.status())) {
             notifications.applyStatusTransition(
-                    command.notificationId(), rowWindow.from(), rowWindow.to(),
+                    command.notificationId(), command.tenantId(), rowWindow.from(), rowWindow.to(),
                     command.status().name(), rank, command.occurredAt());
         }
 

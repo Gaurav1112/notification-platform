@@ -3,19 +3,24 @@ package dev.gaurav.notification.worker.orchestrator;
 import dev.gaurav.notification.domain.enums.Channel;
 import dev.gaurav.notification.domain.enums.DeliveryStatus;
 import dev.gaurav.notification.domain.enums.Priority;
+import dev.gaurav.notification.domain.enums.ScheduleType;
 import dev.gaurav.notification.domain.enums.SuppressionReason;
+import dev.gaurav.notification.messaging.config.KafkaProducerConfig;
 import dev.gaurav.notification.messaging.event.NotificationDispatchEvent;
 import dev.gaurav.notification.messaging.event.NotificationRequestedEvent;
 import dev.gaurav.notification.persistence.entity.NotificationEntity;
 import dev.gaurav.notification.persistence.entity.NotificationRecipient;
 import dev.gaurav.notification.persistence.repository.NotificationRecipientRepository;
 import dev.gaurav.notification.persistence.repository.NotificationRepository;
+import dev.gaurav.notification.persistence.schedule.ScheduledNotificationWriter;
 import dev.gaurav.notification.worker.support.RecipientAddressVault;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import tools.jackson.databind.json.JsonMapper;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -41,6 +46,15 @@ import java.util.UUID;
  * <p>Preferences are evaluated here, at dispatch, not at accept. A campaign accepted at 09:00 and
  * expanded at 14:00 has five hours in which the user can unsubscribe, and a suppression that
  * arrives during that window must win.
+ *
+ * <p><strong>Not everything expanded here goes to Kafka.</strong> A recipient whose message is not
+ * sendable <em>yet</em> — a future {@code scheduledAt}, quiet hours, or both — gets a row in
+ * {@code notif.scheduled_notification} instead of a dispatch event, in the same transaction as its
+ * recipient row. That table is the scheduler's ledger; until it was written to, a deferred
+ * recipient sat at {@code SCHEDULED} with nothing anywhere that would ever pick it up, and the
+ * message was simply never sent. Everything after the write belongs to {@code app-scheduler}: the
+ * due scan hydrates it into Redis, a shard-affine claimer leases it, and the lease is what bounds
+ * the damage if the pod holding it dies.
  */
 @Service
 public class RequestFanOut {
@@ -64,6 +78,8 @@ public class RequestFanOut {
     private final PreferenceResolver preferences;
     private final TemplateRenderer templates;
     private final RecipientAddressVault vault;
+    private final ScheduledNotificationWriter scheduled;
+    private final JsonMapper eventMapper;
     private final Clock clock;
 
     public RequestFanOut(NotificationRepository notifications,
@@ -72,6 +88,8 @@ public class RequestFanOut {
                          PreferenceResolver preferences,
                          TemplateRenderer templates,
                          RecipientAddressVault vault,
+                         ScheduledNotificationWriter scheduled,
+                         @Qualifier(KafkaProducerConfig.EVENT_JSON_MAPPER) JsonMapper eventMapper,
                          Clock clock) {
         this.notifications = notifications;
         this.recipients = recipients;
@@ -79,6 +97,8 @@ public class RequestFanOut {
         this.preferences = preferences;
         this.templates = templates;
         this.vault = vault;
+        this.scheduled = scheduled;
+        this.eventMapper = eventMapper;
         this.clock = clock;
     }
 
@@ -87,7 +107,8 @@ public class RequestFanOut {
      *
      * @param dispatches events to publish, one per (recipient, channel) that is actually sendable
      * @param suppressed rows written as {@code SUPPRESSED}; reported, never silently dropped
-     * @param deferred   rows parked for quiet hours
+     * @param deferred   rows handed to {@code notif.scheduled_notification} instead of Kafka —
+     *                   quiet hours, a future {@code scheduledAt}, or both
      */
     public record FanOutResult(List<NotificationDispatchEvent> dispatches, int suppressed, int deferred) {
 
@@ -118,6 +139,10 @@ public class RequestFanOut {
 
         List<String> userRefs = manifestReader.read(event);
         var dispatches = new ArrayList<NotificationDispatchEvent>(userRefs.size() * event.channels().size());
+        // Accumulated and written once at the end. A campaign expanded into a quiet-hours window
+        // is thousands of rows, and at that size one round trip per recipient is the cost, not
+        // the insert.
+        var parked = new ArrayList<ScheduledNotificationWriter.ScheduledInsert>();
         int suppressed = 0;
         int deferred = 0;
 
@@ -130,8 +155,13 @@ public class RequestFanOut {
         // So adopt what accept created, keyed by channel. Anything not found is created, because
         // a request can legitimately reach fan-out without an accept row: a replay after the
         // notification partition was dropped, or a future scheduled path that enqueues directly.
+        //
+        // Scoped by tenant as well as by request id, because this is an adoption and not a read:
+        // a row found here has this campaign's recipients hung off it and its status advanced. A
+        // request id that reached another tenant's row would graft one tenant's audience onto the
+        // other's notification.
         var existing = notifications
-                .findByRequest(event.requestId(),
+                .findByRequest(event.requestId(), event.tenantId(),
                         now.minus(FANOUT_LOOKBACK), now.plus(FANOUT_LOOKAHEAD))
                 .stream()
                 .collect(java.util.stream.Collectors.toMap(
@@ -182,13 +212,17 @@ public class RequestFanOut {
                 }
 
                 var row = newRecipient(event, notification, channel, userRef, sealed.get(), now);
-                if (decision.deferral().isPresent()) {
-                    // TODO(phase-9): hand the deferral to the scheduler rather than parking the
-                    // row. Until then the row is visible and reportable, which is better than a
-                    // dispatch event that arrives inside the user's quiet hours.
+                Instant dueAt = dueAt(event, decision, now);
+                if (dueAt != null) {
+                    // The recipient row still gets written and still says SCHEDULED, because it is
+                    // what the delivery report and the status endpoint read. What changed is that
+                    // the work itself now exists somewhere that will act on it: before this, the
+                    // row was parked and nothing anywhere was ever going to pick it up again.
                     row.setStatus(DeliveryStatus.SCHEDULED);
-                    row.setNextAttemptAt(decision.deferUntil());
+                    row.setNextAttemptAt(dueAt);
                     recipients.save(row);
+                    parked.add(park(event, notification, row, channel, dueAt,
+                            dispatchFor(event, notification, row, channel, sealed.get(), rendered)));
                     deferred++;
                     continue;
                 }
@@ -198,7 +232,87 @@ public class RequestFanOut {
                 dispatches.add(dispatchFor(event, notification, row, channel, sealed.get(), rendered));
             }
         }
+
+        // Same transaction as the recipient rows above, so "parked" and "scheduled" commit as one
+        // fact. Splitting them would create the state this whole path exists to avoid: a recipient
+        // row saying SCHEDULED with no scheduled_notification row behind it, which is invisible to
+        // every queue and every metric and never sends.
+        int written = scheduled.insertAll(parked);
+        if (written != parked.size()) {
+            // ON CONFLICT DO NOTHING absorbed a duplicate — a retried statement, or a re-expansion
+            // that reused a recipient id. Harmless, and worth seeing, because a persistent
+            // shortfall means fan-out is running twice.
+            log.info("request {}: {} of {} deferred rows were already scheduled",
+                    event.requestId(), parked.size() - written, parked.size());
+        }
         return new FanOutResult(List.copyOf(dispatches), suppressed, deferred);
+    }
+
+    /**
+     * When this recipient's message may first be sent, or {@code null} for "now".
+     *
+     * <p>The <em>later</em> of the two constraints, never the first one found. A receipt scheduled
+     * for 09:00 whose owner is in quiet hours until 08:00 goes at 09:00; one scheduled for 02:00
+     * with the same quiet hours goes at 08:00. Taking whichever was checked first gets one of
+     * those two cases wrong, and the wrong one is the one that wakes the user up.
+     *
+     * <p>A {@code scheduledAt} already in the past is not a deferral. Requests sit in Kafka, and a
+     * broker outage drained by the outbox sweeper routinely delivers a request whose scheduled
+     * time has passed; parking it would schedule work that is already due and add a full hydrator
+     * round trip to a message that should go now.
+     */
+    private static Instant dueAt(NotificationRequestedEvent event,
+                                 PreferenceResolver.PreferenceDecision decision,
+                                 Instant now) {
+        Instant latest = null;
+        if (event.scheduleType() == ScheduleType.SCHEDULED
+                && event.scheduledAt() != null && event.scheduledAt().isAfter(now)) {
+            latest = event.scheduledAt();
+        }
+        Instant deferUntil = decision.deferUntil();
+        if (deferUntil != null && deferUntil.isAfter(now)
+                && (latest == null || deferUntil.isAfter(latest))) {
+            latest = deferUntil;
+        }
+        return latest;
+    }
+
+    /**
+     * One row of {@code notif.scheduled_notification}.
+     *
+     * <p><strong>The whole dispatch event is serialised into the row.</strong> Not a pointer to
+     * it: {@code ShardAffineClaimer} deserialises this string and publishes it unchanged, so the
+     * claim loop performs no joins at 74,600 rows/s, and the event carries the same
+     * {@code eventId} however many times the row is redelivered — which is what makes the
+     * at-least-once duplicate the lease permits harmless rather than a second message.
+     *
+     * <p>The scheduled row's id <em>is</em> the recipient row's id. That makes triage trivial (a
+     * DLQ record's {@code sourceKey} is a recipient you can look up) and gives the writer's
+     * {@code ON CONFLICT DO NOTHING} something real to protect: a retried insert of the same
+     * batch. It does not make re-expansion idempotent — a genuine re-expansion mints a new
+     * recipient row and therefore a new id — and it is not meant to. That is the dedup key in
+     * {@link RequestedEventListener}'s job.
+     */
+    private ScheduledNotificationWriter.ScheduledInsert park(NotificationRequestedEvent event,
+                                                             NotificationEntity notification,
+                                                             NotificationRecipient row,
+                                                             Channel channel,
+                                                             Instant dueAt,
+                                                             NotificationDispatchEvent dispatch) {
+        return new ScheduledNotificationWriter.ScheduledInsert(
+                row.getId(),
+                dueAt,
+                // Hashed from the same (tenant, recipient, channel) triple that keys the dispatch
+                // topics, so a recipient's deferred traffic spreads exactly like their live
+                // traffic and no shard becomes the "everything scheduled for 09:00" shard.
+                ScheduledNotificationWriter.shardFor(event.tenantId(), row.getId(), channel.name()),
+                event.tenantId(),
+                notification.getId(),
+                notification.getCreatedAt(),
+                row.getId(),
+                channel.name(),
+                event.trafficClass().name(),
+                eventMapper.writeValueAsString(dispatch));
     }
 
     private NotificationEntity newNotification(NotificationRequestedEvent event, Channel channel, Instant now) {

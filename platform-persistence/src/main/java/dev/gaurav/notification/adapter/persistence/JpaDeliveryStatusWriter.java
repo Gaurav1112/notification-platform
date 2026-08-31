@@ -52,10 +52,22 @@ public class JpaDeliveryStatusWriter implements DeliveryStatusWriter {
         this.tenants = Objects.requireNonNull(tenants, "tenants");
     }
 
+    /**
+     * <p>The tenant is resolved and passed into the guard rather than trusted from the recipient
+     * id. Webhook payloads name a recipient, and a recipient id is a UUID an attacker can guess or
+     * replay; the guard's {@code tenant_id} predicate is what makes a transition addressed at
+     * someone else's row affect zero rows instead of ending their delivery.
+     *
+     * <p>{@code requireInternalId} rather than a silent empty: reaching this method with a tenant
+     * reference that resolves to nothing means the edge check was bypassed, and returning "0 rows,
+     * stale" for it would record the forgery as ordinary out-of-order traffic.
+     */
     @Override
     public int applyStatus(StatusTransition transition) {
+        long tenant = tenants.requireInternalId(transition.tenantId());
         return recipients.applyStatusTransition(
                 transition.recipientId(),
+                tenant,
                 PartitionWindows.dayStart(transition.recipientCreatedAt()),
                 PartitionWindows.dayEnd(transition.recipientCreatedAt()),
                 transition.proposed().name(),

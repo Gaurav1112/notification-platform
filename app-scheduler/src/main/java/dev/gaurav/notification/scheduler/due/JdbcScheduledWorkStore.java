@@ -12,6 +12,7 @@ import java.util.UUID;
 
 import dev.gaurav.notification.domain.enums.Channel;
 import dev.gaurav.notification.domain.enums.TrafficClass;
+import dev.gaurav.notification.persistence.schedule.ScheduledNotificationWriter;
 
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
@@ -37,39 +38,16 @@ import org.springframework.transaction.annotation.Transactional;
  * partitions.
  *
  * <p><strong>Required schema.</strong> This class targets {@code notif.scheduled_notification},
- * which the design specifies (§6.3, §8.6) but which is <em>not</em> in {@code V1__baseline.sql}.
- * The DDL belongs to {@code platform-persistence}, so it is reported as a gap rather than smuggled
- * in here. The contract relied on:
+ * created by {@code V2__scheduled_notification.sql} in {@code platform-persistence}. That
+ * migration is the contract for every statement below, and it carries the reasoning for the two
+ * choices this class depends on but cannot enforce: the immutable {@code due_bucket} partition key
+ * and the biconditional {@code CHECK ((state = 'CLAIMED') = (claimed_by IS NOT NULL))}.
  *
- * <pre>{@code
- * CREATE TABLE notif.scheduled_notification (
- *     due_bucket              date         NOT NULL,          -- partition key, immutable
- *     id                      uuid         NOT NULL,          -- UUIDv7
- *     due_at                  timestamptz  NOT NULL,
- *     shard                   smallint     NOT NULL,          -- 0..255, fixed at insert
- *     tenant_id               bigint       NOT NULL,
- *     notification_id         uuid         NOT NULL,
- *     notification_created_at timestamptz  NOT NULL,
- *     recipient_id            uuid         NOT NULL,
- *     channel                 varchar(16)  NOT NULL,
- *     traffic_class           varchar(16)  NOT NULL,
- *     state                   varchar(16)  NOT NULL DEFAULT 'READY',
- *     claimed_by              varchar(96),
- *     claim_expires_at        timestamptz,
- *     claim_count             smallint     NOT NULL DEFAULT 0,
- *     payload                 jsonb        NOT NULL,
- *     PRIMARY KEY (due_bucket, id),
- *     CONSTRAINT sn_state_ck CHECK (state IN ('READY','CLAIMED','DISPATCHED','CANCELLED','FAILED')),
- *     CONSTRAINT sn_shard_ck CHECK (shard BETWEEN 0 AND 255),
- *     -- makes "CLAIMED with no owner" unrepresentable
- *     CONSTRAINT sn_owner_ck CHECK ((state = 'CLAIMED') = (claimed_by IS NOT NULL))
- * ) PARTITION BY RANGE (due_bucket);
- *
- * CREATE INDEX sn_due_shard_ix ON notif.scheduled_notification (due_at, shard)
- *     INCLUDE (id) WHERE state = 'READY';
- * CREATE INDEX sn_lease_expiry_ix ON notif.scheduled_notification (claim_expires_at)
- *     WHERE state = 'CLAIMED';
- * }</pre>
+ * <p>Note what is <em>not</em> in the design's original DDL sketch and is in the migration:
+ * {@code sn_id_uk ON (id, due_bucket)}. Every statement here except the scan addresses rows as
+ * {@code id IN (:ids)} with no bucket predicate — the ids come back from Redis, which does not
+ * carry the bucket — and the primary key leads with {@code due_bucket}, so without that index the
+ * claim, the release and the reclaim are all sequential scans of every partition.
  */
 @Repository
 public class JdbcScheduledWorkStore implements ScheduledWorkStore {
@@ -193,9 +171,37 @@ public class JdbcScheduledWorkStore implements ScheduledWorkStore {
     private static final RowMapper<ScheduledWork> MAPPER = JdbcScheduledWorkStore::mapRow;
 
     private final NamedParameterJdbcTemplate jdbc;
+    private final ScheduledNotificationWriter writer;
 
-    public JdbcScheduledWorkStore(NamedParameterJdbcTemplate jdbc) {
+    public JdbcScheduledWorkStore(NamedParameterJdbcTemplate jdbc, ScheduledNotificationWriter writer) {
         this.jdbc = jdbc;
+        this.writer = writer;
+    }
+
+    /**
+     * Delegates rather than carrying its own {@code INSERT}.
+     *
+     * <p>{@code app-worker} is the other writer of this table — fan-out defers a send and parks it
+     * here — and no app module may depend on another, so the statement lives in
+     * {@code platform-persistence} where both can reach it. A private copy here would be a second
+     * column list that drifts from the first, and the specific way it drifts is silent: get
+     * {@code due_bucket} wrong and the row is written successfully into a partition that
+     * {@link #scanReady}'s bucket predicate prunes away.
+     */
+    @Override
+    @Transactional
+    public int schedule(ScheduledWork work) {
+        return writer.insert(new ScheduledNotificationWriter.ScheduledInsert(
+                work.id(),
+                work.dueAt(),
+                work.shard(),
+                work.tenantId(),
+                work.notificationId(),
+                work.notificationCreatedAt(),
+                work.recipientId(),
+                work.channel().name(),
+                work.trafficClass().name(),
+                work.payload()));
     }
 
     @Override

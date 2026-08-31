@@ -68,7 +68,7 @@ class EntityMappingIntegrationTest extends AbstractPostgresTest {
         requests.save(request);
 
         var from = createdAt.truncatedTo(ChronoUnit.DAYS);
-        var reloaded = requests.findInWindow(id, from, from.plus(Duration.ofDays(1))).orElseThrow();
+        var reloaded = requests.findInWindow(id, 1L, from, from.plus(Duration.ofDays(1))).orElseThrow();
 
         assertThat(reloaded.getChannels()).containsExactly("SMS", "EMAIL");
         assertThat(reloaded.getPayload()).contains("123456");
@@ -92,7 +92,7 @@ class EntityMappingIntegrationTest extends AbstractPostgresTest {
         recipients.save(recipient);
 
         var from = createdAt.truncatedTo(ChronoUnit.DAYS);
-        var reloaded = recipients.findInWindow(id, from, from.plus(Duration.ofDays(1))).orElseThrow();
+        var reloaded = recipients.findInWindow(id, 1L, from, from.plus(Duration.ofDays(1))).orElseThrow();
 
         // A lossy round trip here would corrupt ciphertext, and AES-GCM fails closed: the address
         // becomes permanently undecryptable and the recipient can never be contacted again.

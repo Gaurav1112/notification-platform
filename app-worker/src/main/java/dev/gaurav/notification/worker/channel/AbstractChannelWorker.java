@@ -9,6 +9,7 @@ import dev.gaurav.notification.messaging.event.DeadLetterEvent;
 import dev.gaurav.notification.messaging.event.DeliveryStatusEvent;
 import dev.gaurav.notification.messaging.event.NotificationDispatchEvent;
 import dev.gaurav.notification.messaging.event.RetryScheduledEvent;
+import dev.gaurav.notification.messaging.producer.PublishBatch;
 import dev.gaurav.notification.messaging.topic.RetryTier;
 import dev.gaurav.notification.persistence.entity.NotificationEvent.EventSource;
 import dev.gaurav.notification.persistence.entity.NotificationRecipient;
@@ -64,13 +65,47 @@ import java.util.UUID;
  *       {@link dev.gaurav.notification.worker.retry.RetryRouter} and nowhere else.</li>
  * </ol>
  *
- * <p><strong>The offset is acknowledged only after all eight.</strong> Auto-commit would ack a
- * record whose attempt row never landed, which is silent loss; acknowledging late means the worst
- * case is redelivery, and step 1 absorbs that.
+ * <p><strong>The offset is acknowledged only after all eight, and only once every event this
+ * record produced has been acknowledged by the broker.</strong> Auto-commit would ack a record
+ * whose attempt row never landed, which is silent loss; acknowledging late means the worst case is
+ * redelivery, and step 1 absorbs that. The same reasoning applies one layer out to Kafka itself:
+ * {@code kafkaTemplate.send} reports a broker outage by completing a future exceptionally, not by
+ * throwing, so a worker that discards those futures commits the offset for a retry, a failover or
+ * a dead letter that never left the JVM — and that message then has no owner anywhere in the
+ * platform. Every publish this record makes goes into one {@link PublishBatch}, confirmed under
+ * {@link #PUBLISH_CONFIRM_BUDGET} on the line before the ack.
  */
 public abstract class AbstractChannelWorker {
 
     private static final Logger log = LoggerFactory.getLogger(AbstractChannelWorker.class);
+
+    /**
+     * How long one record may wait for the broker to acknowledge the events it produced.
+     *
+     * <p>One second, and the number comes out of the per-record budget rather than out of the air.
+     * {@code max.poll.interval.ms} is 300 000 and {@code max.poll.records} is 30, so a record owns
+     * 300 s / 30 = 10 s of the poll interval. The provider deadline already claims 8 s of that
+     * (see {@code resilience4j.timelimiter} and {@link
+     * dev.gaurav.notification.worker.config.WorkerProperties#providerDeadline()}), leaving 2 s for
+     * everything else the record does. This takes one of the two and leaves the other for the
+     * attempt rows and the Redis dedup call:
+     *
+     * <pre>
+     *   30 records x (8 s provider + 1 s publish confirm) = 270 s  &lt;  300 s   OK
+     *   30 records x (8 s provider + 10 s publish confirm) = 540 s &gt;  300 s   rebalance storm
+     * </pre>
+     *
+     * <p>So the fix for silent loss must not become an eviction: a wait long enough to breach the
+     * poll interval gets the consumer thrown out of the group, its partitions reassigned, and every
+     * in-flight record redelivered to a different pod — worse than the bug, and harder to see.
+     *
+     * <p>One second is roughly five times a healthy {@code acks=all} p99 with {@code linger.ms=25}.
+     * A produce slower than that is a leader election or an outage, and in both cases refusing to
+     * confirm is the right answer: the record is redelivered, and the producer's own 120 s
+     * {@code delivery.timeout.ms} may still land the original — a duplicate the idempotent
+     * receiver and the provider idempotency token both absorb.
+     */
+    private static final Duration PUBLISH_CONFIRM_BUDGET = Duration.ofSeconds(1);
 
     protected final ChannelWorkerSupport support;
     private final Channel channel;
@@ -96,7 +131,9 @@ public abstract class AbstractChannelWorker {
      *
      * <p>{@code final} on purpose: a subclass that overrode this to "just add a quick check" would
      * be reordering the sequence above, and the reordering that matters most — moving the attempt
-     * row after the send — looks like a harmless simplification.
+     * row after the send — looks like a harmless simplification. The second such reordering is
+     * acknowledging before the publishes are confirmed, which is why the confirmation and the ack
+     * are two adjacent lines in one method that cannot be overridden.
      */
     protected final void dispatch(NotificationDispatchEvent event,
                                   ConsumerRecordMetadata metadata, Acknowledgment ack) {
@@ -110,8 +147,15 @@ public abstract class AbstractChannelWorker {
             ack.acknowledge();
             return;
         }
+        // Every event this record produces is collected here and confirmed below, in one wait
+        // rather than one per publish: the sends are already in flight concurrently, so the batch
+        // costs about as long as its slowest member instead of the sum of all three.
+        var publishes = new PublishBatch(3);
         try {
-            handle(event, metadata);
+            handle(event, metadata, publishes);
+            // Before the ack, never after. An unconfirmed publish throws out of here, the offset
+            // is not committed, and the record comes back — which is the whole point.
+            publishes.awaitAll(PUBLISH_CONFIRM_BUDGET);
             ack.acknowledge();
         } catch (RuntimeException e) {
             support.idempotentConsumer().forget(scope, event.eventId());
@@ -119,19 +163,23 @@ public abstract class AbstractChannelWorker {
         }
     }
 
-    private void handle(NotificationDispatchEvent event, ConsumerRecordMetadata metadata) {
+    private void handle(NotificationDispatchEvent event, ConsumerRecordMetadata metadata,
+                        PublishBatch publishes) {
         Instant now = support.clock().instant();
 
-        // Step 2.
+        // Step 2. Scoped by the event's tenant as well as its id: a dispatch event that names
+        // another tenant's recipient must fail to resolve here, before the address is unsealed and
+        // a provider call is made against it.
         var window = PartitionWindow.forDispatch(event.notificationCreatedAt());
         var recipient = support.recipients()
-                .findInWindow(event.recipientId(), window.from(), window.to())
+                .findInWindow(event.recipientId(), event.tenantId(), window.from(), window.to())
                 .orElseThrow(() -> new IllegalStateException(
                         "no notification_recipient row for " + event.recipientId()
+                                + " under tenant " + event.tenantId()
                                 + " in " + window.from() + ".." + window.to()));
 
         // Step 3.
-        if (!isStillEligible(recipient, event, now)) {
+        if (!isStillEligible(recipient, event, now, publishes)) {
             return;
         }
 
@@ -144,7 +192,8 @@ public abstract class AbstractChannelWorker {
             // is written, because there is no provider to attribute one to.
             log.warn("no eligible provider for channel {} tenant {}", channel, event.tenantId());
             route(event, metadata, null, null,
-                    context(event, FailureType.PROVIDER_5XX, false, Optional.empty(), false, now));
+                    context(event, FailureType.PROVIDER_5XX, false, Optional.empty(), false, now),
+                    publishes);
             return;
         }
         var selected = selection.get();
@@ -155,7 +204,7 @@ public abstract class AbstractChannelWorker {
         var attemptRef = support.attempts().registerPending(
                 event.recipientId(), event.tenantId(), event.attemptNumber(),
                 support.providerIds().idOf(providerCode), token);
-        applyAndPublish(event, DeliveryStatus.SENDING, null, providerCode, null, now);
+        applyAndPublish(event, DeliveryStatus.SENDING, null, providerCode, null, now, publishes);
 
         // Step 6.
         var result = selected.provider().send(commandFor(event, recipient, token, now));
@@ -166,7 +215,7 @@ public abstract class AbstractChannelWorker {
                 outcome.providerMessageId(), outcome.failureType(), outcome.failureCode(),
                 outcome.failureDetail(), outcome.costMicros());
         applyAndPublish(event, outcome.status(), outcome, providerCode,
-                outcome.providerMessageId(), support.clock().instant());
+                outcome.providerMessageId(), support.clock().instant(), publishes);
 
         if (outcome.succeeded()) {
             accepted.increment();
@@ -185,7 +234,8 @@ public abstract class AbstractChannelWorker {
         route(event, metadata, providerCode, outcome,
                 context(event, outcome.failureType(), outcome.indeterminate(),
                         outcome.retryAfter(), selected.alternativesAvailable(),
-                        support.clock().instant()));
+                        support.clock().instant()),
+                publishes);
     }
 
     /**
@@ -196,7 +246,8 @@ public abstract class AbstractChannelWorker {
      * enforced by ordering, and a row that reached any terminal state must not be sent.
      */
     private boolean isStillEligible(NotificationRecipient recipient,
-                                    NotificationDispatchEvent event, Instant now) {
+                                    NotificationDispatchEvent event, Instant now,
+                                    PublishBatch publishes) {
         if (recipient.getStatus().isTerminal()) {
             skipped.increment();
             log.debug("recipient {} is already {}; not sending", event.recipientId(), recipient.getStatus());
@@ -204,7 +255,7 @@ public abstract class AbstractChannelWorker {
         }
         if (event.isExpiredAt(now)) {
             skipped.increment();
-            applyAndPublish(event, DeliveryStatus.EXPIRED, null, null, null, now);
+            applyAndPublish(event, DeliveryStatus.EXPIRED, null, null, null, now, publishes);
             return false;
         }
         return true;
@@ -267,23 +318,24 @@ public abstract class AbstractChannelWorker {
      * It lives here, once, rather than in each subclass. TODO(java-21): pattern switch.
      */
     private void route(NotificationDispatchEvent event, ConsumerRecordMetadata metadata,
-                       ProviderCode used, SendOutcome outcome, RetryContext ctx) {
+                       ProviderCode used, SendOutcome outcome, RetryContext ctx,
+                       PublishBatch publishes) {
         var decision = support.retryRouter().decide(ctx);
         Instant now = support.clock().instant();
 
         if (decision instanceof RetryDecision.RetrySameProvider retry) {
-            support.publisher().publishRetry(new RetryScheduledEvent(
+            publishes.add(support.publisher().publishRetry(new RetryScheduledEvent(
                     UUID.randomUUID(), now, event.tenantId(), event.traceparent(),
                     RetryTiers.forTopicOf(retry.tier()), now.plus(retry.delay()),
-                    event.attemptNumber(), retry.failureType(), event));
+                    event.attemptNumber(), retry.failureType(), event)));
             return;
         }
         if (decision instanceof RetryDecision.FailoverNow failover) {
-            failover(event, used, failover, now);
+            failover(event, used, failover, now, publishes);
             return;
         }
         if (decision instanceof RetryDecision.PermanentFailure permanent) {
-            applyAndPublish(event, DeliveryStatus.FAILED, outcome, used, null, now);
+            applyAndPublish(event, DeliveryStatus.FAILED, outcome, used, null, now, publishes);
             if (permanent.suppressAddress()) {
                 support.suppressions().suppress(event.tenantId(), event.recipientId(), channel,
                         suppressionReasonFor(permanent.failureType()));
@@ -299,30 +351,31 @@ public abstract class AbstractChannelWorker {
             return;
         }
         if (decision instanceof RetryDecision.Expired) {
-            applyAndPublish(event, DeliveryStatus.EXPIRED, null, used, null, now);
+            applyAndPublish(event, DeliveryStatus.EXPIRED, null, used, null, now, publishes);
             return;
         }
         if (decision instanceof RetryDecision.DeadLetter dead) {
-            deadLetter(event, metadata, dead, now);
-            applyAndPublish(event, DeliveryStatus.FAILED, outcome, used, null, now);
+            deadLetter(event, metadata, dead, now, publishes);
+            applyAndPublish(event, DeliveryStatus.FAILED, outcome, used, null, now, publishes);
             return;
         }
         throw new IllegalStateException("unhandled RetryDecision: " + decision.getClass().getName());
     }
 
     private void failover(NotificationDispatchEvent event, ProviderCode used,
-                          RetryDecision.FailoverNow failover, Instant now) {
+                          RetryDecision.FailoverNow failover, Instant now,
+                          PublishBatch publishes) {
         var alternative = support.router().select(
                 channel, event.tenantId(), null, used == null ? Set.of() : Set.of(used));
         if (alternative.isEmpty()) {
             // The candidate that existed when the decision was taken has gone since. Treat it as
             // the ladder would: park it rather than dropping it.
             log.warn("failover requested for {} but no alternative provider remains", event.recipientId());
-            support.publisher().publishRetry(new RetryScheduledEvent(
+            publishes.add(support.publisher().publishRetry(new RetryScheduledEvent(
                     UUID.randomUUID(), now, event.tenantId(), event.traceparent(),
                     RetryTier.first(),
                     now.plus(RetryTier.first().delay()),
-                    event.attemptNumber(), FailureType.PROVIDER_5XX, event));
+                    event.attemptNumber(), FailureType.PROVIDER_5XX, event)));
             return;
         }
         if (failover.pageOnCall()) {
@@ -331,13 +384,13 @@ public abstract class AbstractChannelWorker {
             log.error("PAGE: {} on provider {} for channel {}; failing over to {}",
                     failover.failureType(), used, channel, alternative.get().code().value());
         }
-        support.publisher().publishDispatch(
-                Dispatches.nextAttempt(event, alternative.get().code().value()));
+        publishes.add(support.publisher().publishDispatch(
+                Dispatches.nextAttempt(event, alternative.get().code().value())));
     }
 
     private void deadLetter(NotificationDispatchEvent event, ConsumerRecordMetadata metadata,
-                            RetryDecision.DeadLetter dead, Instant now) {
-        support.publisher().publishDeadLetter(new DeadLetterEvent(
+                            RetryDecision.DeadLetter dead, Instant now, PublishBatch publishes) {
+        publishes.add(support.publisher().publishDeadLetter(new DeadLetterEvent(
                 UUID.randomUUID(), now, event.tenantId(), event.traceparent(),
                 metadata.topic(), metadata.partition(), metadata.offset(),
                 event.tenantId() + "|" + event.recipientId() + "|" + channel,
@@ -346,7 +399,7 @@ public abstract class AbstractChannelWorker {
                 event.attemptNumber(), 0,
                 // The address hint, never the address. A DLQ dump is read by more people than any
                 // other artefact in the platform.
-                "recipient=" + event.recipientId() + " address=" + event.addressHint()));
+                "recipient=" + event.recipientId() + " address=" + event.addressHint())));
     }
 
     /**
@@ -359,14 +412,15 @@ public abstract class AbstractChannelWorker {
      */
     private void applyAndPublish(NotificationDispatchEvent event, DeliveryStatus status,
                                  SendOutcome outcome, ProviderCode providerCode,
-                                 String providerMessageId, Instant occurredAt) {
+                                 String providerMessageId, Instant occurredAt,
+                                 PublishBatch publishes) {
         support.applyStatus().apply(new ApplyDeliveryStatusUseCase.Command(
                 event.tenantId(), event.notificationId(), event.notificationCreatedAt(),
                 event.recipientId(), status, occurredAt, EventSource.WORKER,
                 providerCode == null ? null : support.providerIds().idOf(providerCode),
                 event.recipientId() + "|" + status.name() + "|" + event.attemptNumber()));
 
-        support.publisher().publishDelivery(new DeliveryStatusEvent(
+        publishes.add(support.publisher().publishDelivery(new DeliveryStatusEvent(
                 UUID.randomUUID(), occurredAt, event.tenantId(), event.traceparent(),
                 event.notificationId(), event.notificationCreatedAt(), event.recipientId(),
                 channel, status,
@@ -383,7 +437,7 @@ public abstract class AbstractChannelWorker {
                 outcome == null ? null : outcome.failureDetail(),
                 null,
                 outcome == null ? null : outcome.costMicros(),
-                outcome == null || outcome.latency() == null ? null : outcome.latency().toMillis()));
+                outcome == null || outcome.latency() == null ? null : outcome.latency().toMillis())));
     }
 
     /**

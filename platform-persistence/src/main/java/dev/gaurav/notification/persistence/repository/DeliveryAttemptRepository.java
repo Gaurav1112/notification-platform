@@ -16,19 +16,33 @@ import org.springframework.data.repository.query.Param;
  * window parameters here are named {@code attemptedAtFrom} / {@code attemptedAtTo} rather than
  * {@code createdAt*} — the column really is different, and hiding that would invite a caller to
  * pass the notification's window and quietly miss attempts that crossed midnight.
+ *
+ * <p>Every row here is billing evidence: which vendor was used, what it answered, and
+ * {@code cost_micros}. So the two finders that return rows are tenant-scoped, and the two that
+ * aggregate for operations are the deliberate, allowlisted exceptions — see
+ * {@code TenantScopedQueryArchTest}.
  */
 public interface DeliveryAttemptRepository extends JpaRepository<DeliveryAttempt, Long> {
 
-    /** Attempt history for one address, newest first. Served by {@code da_recipient_ix}. */
+    /**
+     * Attempt history for one address, newest first. Served by {@code da_recipient_ix}.
+     *
+     * <p>Tenant-scoped because this is the ledger behind the per-notification attempt view: it
+     * carries the vendor we used, what it charged and what it said when it failed. A recipient id
+     * is a guessable UUID that has already left this system on a Kafka event, so without the
+     * predicate one guessed id exposes another tenant's provider mix and unit economics.
+     */
     @QueryHints(@QueryHint(name = "org.hibernate.readOnly", value = "true"))
     @Query("""
             SELECT a FROM DeliveryAttempt a
              WHERE a.recipientId = :recipientId
+               AND a.tenantId = :tenantId
                AND a.attemptedAt >= :attemptedAtFrom
                AND a.attemptedAt <  :attemptedAtTo
              ORDER BY a.attemptedAt DESC
             """)
     List<DeliveryAttempt> findByRecipient(@Param("recipientId") UUID recipientId,
+                                          @Param("tenantId") Long tenantId,
                                           @Param("attemptedAtFrom") Instant attemptedAtFrom,
                                           @Param("attemptedAtTo") Instant attemptedAtTo);
 
@@ -39,19 +53,34 @@ public interface DeliveryAttemptRepository extends JpaRepository<DeliveryAttempt
      * checks whether an attempt row for this token exists. If it does, the send already happened
      * (or is in flight) and repeating it would charge the tenant twice and possibly deliver a
      * second OTP. Served by the unique index {@code da_token_uk}.
+     *
+     * <p>{@code da_token_uk} is on {@code (idempotency_token, attempted_at)} and is therefore
+     * global, so the tenant predicate narrows the read but not the constraint. That asymmetry is
+     * intentional and safe: the token is derived from the recipient UUID and the attempt number
+     * (see {@code AbstractChannelWorker}), so a cross-tenant token collision is a UUID collision.
+     * Reading another tenant's attempt row — which is what the unscoped version does on a
+     * collision, or on a caller that passes a token it did not generate — is the realistic risk,
+     * and it is the one the predicate removes.
      */
     @Query("""
             SELECT a FROM DeliveryAttempt a
              WHERE a.idempotencyToken = :idempotencyToken
+               AND a.tenantId = :tenantId
                AND a.attemptedAt >= :attemptedAtFrom
                AND a.attemptedAt <  :attemptedAtTo
             """)
     Optional<DeliveryAttempt> findByIdempotencyToken(@Param("idempotencyToken") String idempotencyToken,
+                                                     @Param("tenantId") Long tenantId,
                                                      @Param("attemptedAtFrom") Instant attemptedAtFrom,
                                                      @Param("attemptedAtTo") Instant attemptedAtTo);
 
     /**
      * Attempts left {@code PENDING} past the point where any provider call could still be open.
+     *
+     * <p><strong>Deliberately cross-tenant.</strong> This is the reconciler's input, and a send
+     * whose outcome is unknown is unknown to the platform, not to a tenant — there is no request
+     * and no caller to scope it by. Running it per tenant would mean the tenants nobody thought to
+     * enumerate never get reconciled. Allowlisted in {@code TenantScopedQueryArchTest}.
      *
      * <p>Native with a literal state so the partial index {@code da_provider_fail_ix … WHERE state
      * <> 'SUCCEEDED'} is usable; a bound parameter would defeat it. Every row this returns is a
@@ -75,6 +104,11 @@ public interface DeliveryAttemptRepository extends JpaRepository<DeliveryAttempt
 
     /**
      * Raw success/failure counts for one provider over a window.
+     *
+     * <p><strong>Deliberately cross-tenant.</strong> The question it answers is "is this vendor
+     * working", which is a property of our contract with the vendor and not of any tenant. It
+     * returns {@code [state, count]} pairs and never a row, so no tenant-owned column leaves the
+     * database through it. Allowlisted in {@code TenantScopedQueryArchTest}.
      *
      * <p>Exists for reconciliation and backfill only. <strong>The dashboards and the circuit
      * breaker must not call this</strong> — measured at 481 MB and 291 ms over a single day's

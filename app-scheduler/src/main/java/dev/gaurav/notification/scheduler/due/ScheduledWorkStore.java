@@ -24,6 +24,27 @@ import java.util.UUID;
 public interface ScheduledWorkStore {
 
     /**
+     * Writes one piece of future work, {@code READY} and unclaimed.
+     *
+     * <p>Here rather than only on the writer in {@code platform-persistence} so that this
+     * interface describes the whole life of a row. Without it the scheduler could reclaim, abandon
+     * and dispatch work it had no way to create, which makes every test of the claim path start by
+     * hand-writing SQL that the production writer does not use — and a test that inserts rows
+     * differently from production is a test that cannot catch a writer bug.
+     *
+     * <p>The lease fields on {@code work} are ignored: a row is always born {@code READY} with no
+     * owner, no expiry and {@code claim_count = 0}. Creating work already claimed by somebody is
+     * not a thing any caller legitimately wants, and the schema's biconditional
+     * {@code CHECK ((state = 'CLAIMED') = (claimed_by IS NOT NULL))} would reject most attempts
+     * anyway.
+     *
+     * @return 1 when the row was written, 0 when one with the same id and due bucket already
+     *         existed — which is what an at-least-once fan-out replay looks like, and is not an
+     *         error
+     */
+    int schedule(ScheduledWork work);
+
+    /**
      * Reads READY rows due before {@code horizonEnd}, without locking anything.
      *
      * <p><strong>A pure {@code SELECT}, deliberately.</strong> The hydrator does not mutate

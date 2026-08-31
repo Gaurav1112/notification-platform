@@ -3,6 +3,7 @@ package dev.gaurav.notification.worker.retry;
 import dev.gaurav.notification.domain.enums.DeliveryStatus;
 import dev.gaurav.notification.messaging.event.RetryScheduledEvent;
 import dev.gaurav.notification.messaging.producer.NotificationEventPublisher;
+import dev.gaurav.notification.messaging.producer.PublishBatch;
 import dev.gaurav.notification.messaging.topic.Topics;
 import dev.gaurav.notification.persistence.repository.NotificationRecipientRepository;
 import dev.gaurav.notification.worker.config.WorkerListenerConfiguration;
@@ -24,6 +25,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -73,6 +75,23 @@ public class RetryTierListener {
     public static final String LISTENER_ID = "retry-tiers";
 
     public static final String CONSUMER_GROUP = "notification-worker.retry";
+
+    /**
+     * How long the republish may wait for the broker to acknowledge it.
+     *
+     * <p>Waiting at all is the point: this listener's republish <em>is</em> the retry. Discarding
+     * the future and acknowledging anyway lets a broker blip silently end the retry chain for
+     * every parked message in the poll. They are not dead
+     * lettered and they are not re-parked; they simply stop, which is the failure the tiers exist
+     * to prevent.
+     *
+     * <p>Budget arithmetic: {@code max.poll.records} is 30 and {@code max.poll.interval.ms} is
+     * 300 000, so the ceiling this adds between two polls is 30 × 5 s = 150 s, half the interval.
+     * This consumer does one point lookup and no provider call, so the rest of the interval is
+     * amply covered. A wait long enough to breach the interval would evict the consumer and
+     * rebalance the tiers — the exact outcome the pause-instead-of-sleep design avoids.
+     */
+    private static final Duration PUBLISH_CONFIRM_BUDGET = Duration.ofSeconds(5);
 
     private static final Logger log = LoggerFactory.getLogger(RetryTierListener.class);
 
@@ -135,7 +154,13 @@ public class RetryTierListener {
             return;
         }
 
-        publisher.publishDispatch(Dispatches.nextAttempt(event.dispatch(), null));
+        // Confirmed, then acknowledged, in that order. An unconfirmed republish throws, the offset
+        // stays put, and the message is re-delivered when the tier resumes — harmless, because a
+        // duplicate republish carries the same eventId and attempt number and is dropped by the
+        // channel worker's attempt-scoped idempotent receiver.
+        new PublishBatch(1)
+                .add(publisher.publishDispatch(Dispatches.nextAttempt(event.dispatch(), null)))
+                .awaitAll(PUBLISH_CONFIRM_BUDGET);
         republished.increment();
         ack.acknowledge();
     }
@@ -203,7 +228,11 @@ public class RetryTierListener {
             return false;
         }
         var window = PartitionWindow.forDispatch(dispatch.notificationCreatedAt());
-        var recipient = recipients.findInWindow(dispatch.recipientId(), window.from(), window.to());
+        // Scoped by the tenant on the event, not by the recipient id alone. A replayed or forged
+        // parked message naming another tenant's recipient must find nothing and be dropped, not
+        // read that tenant's row and decide on its behalf whether to send.
+        var recipient = recipients.findInWindow(
+                dispatch.recipientId(), dispatch.tenantId(), window.from(), window.to());
         if (recipient.isEmpty()) {
             // The row is gone — retention, or a request that was never committed. Republishing
             // would produce a dispatch the channel worker cannot resolve, three times over.

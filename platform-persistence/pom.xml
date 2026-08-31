@@ -39,5 +39,13 @@
         <dependency><groupId>org.testcontainers</groupId><artifactId>testcontainers-postgresql</artifactId><scope>test</scope></dependency>
         <dependency><groupId>org.testcontainers</groupId><artifactId>testcontainers-junit-jupiter</artifactId><scope>test</scope></dependency>
         <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency>
+        <!--
+          TenantScopedQueryArchTest uses ArchUnit's ClassFileImporter purely to enumerate the
+          repository interfaces in one package; the assertions themselves are plain reflection over
+          @Query. Scanning the compiled classes rather than a hand-maintained list is the whole
+          point — a list would have to be edited by the same commit that adds an unscoped query.
+          Version and test scope come from the root dependencyManagement, same as platform-domain.
+        -->
+        <dependency><groupId>com.tngtech.archunit</groupId><artifactId>archunit-junit5</artifactId></dependency>
     </dependencies>
 </project>

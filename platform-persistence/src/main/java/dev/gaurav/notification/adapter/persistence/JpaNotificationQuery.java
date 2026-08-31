@@ -102,7 +102,7 @@ public class JpaNotificationQuery implements NotificationQuery {
     public Optional<NotificationStatusView> findStatus(String tenantId, UUID notificationId) {
         var now = clock.instant();
         return tenants.internalIdOf(tenantId)
-                .flatMap(tenant -> notifications.findInWindowForTenant(notificationId, tenant,
+                .flatMap(tenant -> notifications.findInWindow(notificationId, tenant,
                         PartitionWindows.lookbackFrom(now), PartitionWindows.lookbackTo(now)))
                 .map(JpaNotificationQuery::toStatusView);
     }

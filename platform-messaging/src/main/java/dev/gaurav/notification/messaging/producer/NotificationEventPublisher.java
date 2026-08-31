@@ -26,13 +26,31 @@ import java.util.concurrent.CompletableFuture;
  * {@code recipientId} eventually gets left out of one of them and that one path builds a hot
  * partition. Both decisions live here, next to the reasoning for them.
  *
- * <p><strong>Publishing is a fast path, not the commitment.</strong> The row is already committed
- * in PostgreSQL before any of these methods is called — PostgreSQL is the system of record and
- * Kafka is transport. A failed publish is picked up by the outbox sweeper, so the returned future
- * is for latency instrumentation and backpressure, not for correctness. Nothing here should be
- * blocked on with {@code .get()} inside a request thread.
+ * <p><strong>The returned future is not optional, and what it means depends on who is calling.</strong>
+ * Every method returns the {@link CompletableFuture} from {@code kafkaTemplate.send}, because
+ * {@code send} does not throw when the broker is unreachable — it completes that future
+ * exceptionally, seconds later. Discarding it discards the only evidence that the event exists.
+ * There are exactly two kinds of caller:
+ *
+ * <ul>
+ *   <li><strong>Outbox-backed (the API accept path).</strong> The outbox row is written in the same
+ *       transaction as the notification, so a failed publish is swept up and retried. There the
+ *       future really is latency instrumentation, and blocking on it inside a request thread would
+ *       be wrong.</li>
+ *   <li><strong>Consumer paths (worker, scheduler).</strong> There is no outbox row behind these:
+ *       the event <em>is</em> the continuation of the work. The future is the only thing that says
+ *       whether the dispatch, retry, failover or dead-letter record survived, and it must be
+ *       confirmed <em>before</em> the consumer acknowledges its offset. Acknowledging first commits
+ *       an offset for work that never left the JVM — recipients stuck in {@code QUEUED} forever,
+ *       with no retry, no DLQ and no alert. Collect the futures in a {@link PublishBatch} and call
+ *       {@link PublishBatch#awaitAll(java.time.Duration)} on the line before the ack.</li>
+ * </ul>
+ *
+ * <p>PostgreSQL is still the system of record and Kafka is still transport; that is what makes
+ * redelivery after a refused ack the cheap outcome rather than a duplicate send.
  *
  * @see PartitionKeys
+ * @see PublishBatch
  */
 @Component
 public class NotificationEventPublisher {

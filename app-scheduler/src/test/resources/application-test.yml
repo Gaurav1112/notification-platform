@@ -68,9 +68,12 @@ logging:
     org.apache.kafka: error
     io.lettuce: error
     # A fixedDelay job runs once immediately whatever its interval, so the first
-    # tick of the due scan and the shard assignment still fires. Both then fail:
-    # there is no notif.scheduled_notification table in V1__baseline.sql (see
-    # docs/STATUS.md) and there is no Valkey. Neither is what this test is about,
-    # and a page of stack traces under a passing test teaches people to skip the
-    # output. Silenced here and nowhere else.
+    # tick of the due scan and the shard assignment still fires. Both then fail,
+    # for reasons that have nothing to do with the bean graph this test is about:
+    # Flyway is off above and JPA ddl-auto only creates the mapped entities, so
+    # notif.scheduled_notification does not exist on this H2 instance (the table
+    # itself is real — V2__scheduled_notification.sql — and the claim path is
+    # tested against PostgreSQL in ScheduledWorkStoreIntegrationTest), and there
+    # is no Valkey. A page of stack traces under a passing test teaches people to
+    # skip the output. Silenced here and nowhere else.
     org.springframework.scheduling.support.TaskUtils: "off"

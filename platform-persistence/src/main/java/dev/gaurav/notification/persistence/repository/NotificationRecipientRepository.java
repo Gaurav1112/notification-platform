@@ -15,29 +15,55 @@ import org.springframework.transaction.annotation.Transactional;
  * Reads and status writes for the per-address rows the workers operate on.
  *
  * <p>Partitioned daily by {@code created_at}; every finder takes a window. See the package
- * javadoc for why the derived shortcuts are not used.
+ * javadoc for why the derived shortcuts are not used, and for why every finder here also takes a
+ * {@code tenantId}.
+ *
+ * <p>The two sweeps — {@link #findDueForRetry} and {@link #findStaleInFlight} — are the deliberate
+ * exceptions. They are infrastructure that has to see the whole table, and they are named in the
+ * allowlist inside {@code TenantScopedQueryArchTest}.
  */
 public interface NotificationRecipientRepository extends JpaRepository<NotificationRecipient, UUID> {
 
+    /**
+     * Point lookup, pruned to one partition and scoped to one tenant.
+     *
+     * <p>The recipient id is a bare UUID that travels on a Kafka dispatch event and comes back on a
+     * provider webhook, so it is an identifier an attacker can supply. Without
+     * {@code tenantId} in the predicate this method hands the caller another tenant's row —
+     * ciphertext, address hint, delivery state and all — on nothing more than a guessed id, and
+     * every caller becomes responsible for remembering to compare the tenant afterwards. Making it
+     * a predicate rather than a post-fetch check also collapses "not yours" and "does not exist"
+     * into the same empty answer, so the endpoint above cannot be used as an existence oracle.
+     */
     @Query("""
             SELECT r FROM NotificationRecipient r
              WHERE r.id = :id
+               AND r.tenantId = :tenantId
                AND r.createdAt >= :createdAtFrom
                AND r.createdAt <  :createdAtTo
             """)
     Optional<NotificationRecipient> findInWindow(@Param("id") UUID id,
+                                                 @Param("tenantId") Long tenantId,
                                                  @Param("createdAtFrom") Instant createdAtFrom,
                                                  @Param("createdAtTo") Instant createdAtTo);
 
-    /** Served by {@code nrec_notification_ix}. */
+    /**
+     * Served by {@code nrec_notification_ix}.
+     *
+     * <p>{@code notificationId} alone is not a tenant boundary: one guessed notification id would
+     * otherwise enumerate that notification's entire audience. The tenant predicate is what makes
+     * a wrong-tenant walk return nothing instead of a recipient list.
+     */
     @Query("""
             SELECT r FROM NotificationRecipient r
              WHERE r.notificationId = :notificationId
+               AND r.tenantId = :tenantId
                AND r.createdAt >= :createdAtFrom
                AND r.createdAt <  :createdAtTo
              ORDER BY r.createdAt
             """)
     List<NotificationRecipient> findByNotification(@Param("notificationId") UUID notificationId,
+                                                   @Param("tenantId") Long tenantId,
                                                    @Param("createdAtFrom") Instant createdAtFrom,
                                                    @Param("createdAtTo") Instant createdAtTo);
 
@@ -48,19 +74,32 @@ public interface NotificationRecipientRepository extends JpaRepository<Notificat
      * is the vendor's identifier, and nothing stops two vendors — or one vendor across a contract
      * migration — from issuing the same string. A signature promising uniqueness we do not
      * control would turn that into an exception on the webhook path.
+     *
+     * <p>That same non-uniqueness is exactly why the tenant predicate matters here more than
+     * anywhere else on this interface. The input is a string chosen by an outside party, arriving
+     * on a public webhook endpoint; two tenants sharing one vendor account can legitimately collide
+     * on it. Unscoped, a forged callback carrying another tenant's message id resolves to that
+     * tenant's recipient row and drives a status transition on it.
      */
     @Query("""
             SELECT r FROM NotificationRecipient r
              WHERE r.providerMessageId = :providerMessageId
+               AND r.tenantId = :tenantId
                AND r.createdAt >= :createdAtFrom
                AND r.createdAt <  :createdAtTo
             """)
     List<NotificationRecipient> findByProviderMessageId(@Param("providerMessageId") String providerMessageId,
+                                                        @Param("tenantId") Long tenantId,
                                                         @Param("createdAtFrom") Instant createdAtFrom,
                                                         @Param("createdAtTo") Instant createdAtTo);
 
     /**
      * Retry candidates whose backoff has elapsed.
+     *
+     * <p><strong>Deliberately cross-tenant.</strong> This is the scheduler's backstop sweep, not a
+     * tenant data access: it runs on a timer with no request and therefore no tenant, and a
+     * per-tenant variant would have to iterate every tenant on every sweep and would miss the
+     * tenants it did not know to ask about. Allowlisted in {@code TenantScopedQueryArchTest}.
      *
      * <p>Native, and the status list is written as literals rather than bound parameters, because
      * the index this has to hit is <em>partial</em>:
@@ -100,6 +139,10 @@ public interface NotificationRecipientRepository extends JpaRepository<Notificat
      * <p>These are the leases of workers that died between claiming and reporting. Nothing else
      * will ever move them, so without this sweep they stay {@code CLAIMED} forever and the
      * recipient simply never hears from us.
+     *
+     * <p><strong>Deliberately cross-tenant</strong>, for the same reason as {@link #findDueForRetry}:
+     * a dead worker's leases do not belong to whoever happens to be making a request. Allowlisted
+     * in {@code TenantScopedQueryArchTest}.
      */
     @Query(value = """
             SELECT *
@@ -123,12 +166,21 @@ public interface NotificationRecipientRepository extends JpaRepository<Notificat
      * atomic statement that rejects stale, duplicate and post-terminal events in its
      * {@code WHERE} clause.
      *
+     * <p><strong>{@code tenant_id} is part of that clause and not an afterthought.</strong> This is
+     * a write reachable from a public webhook: the caller supplies a recipient id and a status, and
+     * without the tenant predicate any tenant can mark any other tenant's message
+     * {@code DELIVERED}, {@code BOUNCED} or {@code FAILED}. Because the guard is monotonic, that
+     * write is <em>irreversible</em> — a forged {@code BOUNCED} is terminal and nothing will ever
+     * move the row again, so the real provider callback is refused and the recipient is quietly
+     * abandoned. A read leak is bad; this one silently destroys another tenant's delivery.
+     *
      * <p>{@code last_status_at} moves with {@code greatest(...)} so a reordered event cannot drag
      * the in-flight sweep's clock backwards and make a live row look abandoned.
      *
-     * <p>Returning {@code 0} is the normal outcome for a duplicated callback, not an error.
+     * <p>Returning {@code 0} is the normal outcome for a duplicated callback, not an error — and
+     * now also for a cross-tenant one, which is the correct answer for it too.
      *
-     * @return 1 if applied, 0 if the event was stale, duplicated or illegal
+     * @return 1 if applied, 0 if the event was stale, duplicated, illegal or from another tenant
      */
     @Transactional
     @Modifying(clearAutomatically = true, flushAutomatically = true)
@@ -138,6 +190,7 @@ public interface NotificationRecipientRepository extends JpaRepository<Notificat
                    status_rank    = :newRank,
                    last_status_at = greatest(r.last_status_at, :occurredAt)
              WHERE r.id          = :id
+               AND r.tenant_id    = :tenantId
                AND r.created_at >= :createdAtFrom
                AND r.created_at  < :createdAtTo
                AND r.status_rank < :newRank
@@ -147,6 +200,7 @@ public interface NotificationRecipientRepository extends JpaRepository<Notificat
                                   AND d.is_terminal)
             """, nativeQuery = true)
     int applyStatusTransition(@Param("id") UUID id,
+                              @Param("tenantId") Long tenantId,
                               @Param("createdAtFrom") Instant createdAtFrom,
                               @Param("createdAtTo") Instant createdAtTo,
                               @Param("newStatus") String newStatus,

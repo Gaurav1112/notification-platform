@@ -33,6 +33,19 @@
              real 18.6 container in platform-persistence under -Pintegration. -->
         <dependency><groupId>com.h2database</groupId><artifactId>h2</artifactId><scope>test</scope></dependency>
 
+        <!--
+          ScheduledWorkStoreIntegrationTest runs the real CLAIM_SQL. That statement is a CTE with
+          FOR UPDATE SKIP LOCKED feeding an UPDATE … RETURNING against a range-partitioned table,
+          and H2 in PostgreSQL-compatibility mode either rejects it or accepts it with different
+          locking semantics — which is exactly how a concurrency bug ships under a green suite. So
+          the claim is tested on the same 18.6 image the schema was verified against. Tagged
+          @Tag("integration") and excluded from the default build, same as platform-persistence.
+        -->
+        <dependency><groupId>org.testcontainers</groupId><artifactId>testcontainers-postgresql</artifactId><scope>test</scope></dependency>
+        <dependency><groupId>org.testcontainers</groupId><artifactId>testcontainers-junit-jupiter</artifactId><scope>test</scope></dependency>
+        <!-- flyway-core and flyway-database-postgresql arrive transitively from
+             platform-persistence at compile scope; re-declaring them here at test scope would
+             narrow them and strip Flyway out of the packaged jar's runtime classpath. -->
     </dependencies>
     <build>
         <plugins>
